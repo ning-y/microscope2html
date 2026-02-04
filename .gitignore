@@ -1,0 +1,12 @@
+__pycache__/
+*.egg-info/
+build/
+dist/
+*.tif
+*.html
+TileConfiguration.txt
+TileConfiguration.registered.txt
+stitch_tiles.ijm
+openseadragon-bin-*
+openseadragon-scalebar.js
+osd.zip
