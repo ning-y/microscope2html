@@ -7,10 +7,9 @@ setup(
     author="Your Name",
     author_email="your.email@example.com",
     packages=find_packages(),
-    py_modules=["microscope2html"],
     entry_points={
         "console_scripts": [
-            "microscope2html=microscope2html:main",
+            "microscope2html=microscope2html.cli:main",
         ],
     },
     install_requires=[
