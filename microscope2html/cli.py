@@ -345,7 +345,7 @@ def main():
         generate_macro(macro_file, config_file_for_macro, output_tif, args.input_dir, compute_overlap, fix_white)
         
         print("Running Fiji...")
-        cmd = ["nix", "run", "nixpkgs#fiji", "--", "--headless", "--console", "-macro", macro_file]
+        cmd = ["fiji", "--headless", "--console", "-macro", macro_file]
         
         try:
             subprocess.run(cmd, check=True)

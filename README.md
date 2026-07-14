@@ -11,15 +11,28 @@ A CLI tool to stitch microscope TIFF tiles (OME-TIFF) into a large image and gen
 
 ## Requirements
 
--   Python 3.6+
--   [Fiji (ImageJ)](https://fiji.sc/) installed and available in the system path or via Nix.
+-   Python 3.12+
+-   [Fiji (ImageJ)](https://fiji.sc/) installed and available on `PATH`.
 -   Python dependencies: `numpy`, `tifffile`, `Pillow`
 
 ## Installation
 
+### Via pip (any platform)
+
 ```bash
 pip install .
 ```
+
+Make sure Fiji is available on your `PATH`.
+
+### Via Nix (NixOS / Nix package manager)
+
+```bash
+nix develop
+python -m microscope2html.cli --help
+```
+
+This drops you into a shell with Python 3.12, all dependencies, and Fiji. See `flake.nix` for details.
 
 ## Usage
 
