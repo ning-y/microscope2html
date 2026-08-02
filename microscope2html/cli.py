@@ -2,7 +2,7 @@
 """microscope2html — Stitch microscope tiles and generate an HTML viewer.
 
 Usage:
-    microscope2html *.TIF [--output viewer.html] [--margin 100] [--cluster-threshold 2.0]
+    microscope2html *.TIF [--output viewer.html] [--margin 100] [--overlap-margin 0.1]
 """
 
 import argparse
@@ -21,8 +21,13 @@ import tifffile
 from PIL import Image
 
 from microscope2html.clustering import cluster_tiles
+from microscope2html.grid_split import (
+    parse_registered,
+    detect_compression,
+    grid_consistency_split,
+    split_tiles_by_group,
+)
 from microscope2html.layout import compress_layout, compute_canvas_bounds
-from microscope2html.overlap import stitch_with_overlap
 
 Image.MAX_IMAGE_PIXELS = None
 
@@ -153,8 +158,8 @@ eval("script", "System.exit(0);");
         f.write(macro)
 
 
-FIJI_DIR = os.environ.get("FIJI_DIR", "/tmp/fiji/Fiji")
-FIJI_CMD = os.path.join(FIJI_DIR, "fiji") if os.path.isdir(FIJI_DIR) else "fiji"
+FIJI_DIR = os.environ.get("FIJI_DIR", "/tmp/fiji/Fiji.app")
+FIJI_CMD = os.path.join(FIJI_DIR, "ImageJ-linux64") if os.path.isdir(FIJI_DIR) else "fiji"
 
 
 def _fiji_available():
@@ -169,29 +174,89 @@ def _fiji_available():
         return False
 
 
-def stitch_roi(roi_tiles, output_tif, backend, fix_white=False):
-    """Stitch a multi-tile ROI using the specified backend.
-
-    Args:
-        backend: ``"fiji"`` (default) or ``"numpy-fft"``.
-        fix_white: (Fiji only) discard a spurious white channel.
-    """
-    if backend == "fiji":
-        if not _fiji_available():
-            print("Error: Fiji backend selected but Fiji is not available.",
-                  file=sys.stderr)
-            print("  Install Fiji or use --backend numpy-fft", file=sys.stderr)
-            sys.exit(1)
-        _stitch_roi_fiji(roi_tiles, output_tif, fix_white)
-    elif backend == "numpy-fft":
-        stitch_with_overlap(roi_tiles, output_tif)
-    else:
-        print(f"Error: unknown backend '{backend}'", file=sys.stderr)
-        sys.exit(1)
-
-
-def _stitch_roi_fiji(roi_tiles, output_tif, fix_white=False):
+def stitch_roi(roi_tiles, output_tif, fix_white=False):
     """Stitch a multi-tile ROI using Fiji."""
+    if not _fiji_available():
+        print("Error: Fiji is not available. Install Fiji to continue.",
+              file=sys.stderr)
+        sys.exit(1)
+    _stitch_roi_fiji(roi_tiles, output_tif, fix_white)
+
+
+def stitch_roi_recursive(roi_tiles, output_prefix, fix_white=False,
+                         tile_w=2048, tile_h=1536):
+    """Stitch an ROI, detect over-merging, and recursively split if needed.
+
+    After Fiji stitching, compares the registered canvas size to the
+    stage-coordinate-expected canvas.  If significantly smaller
+    (cross-section pull), splits the tiles using grid-consistency
+    filtering and re-stitches each sub-group.
+
+    Returns:
+        List of (image_path, tile_group) tuples, where tile_group is the
+        list of tile metadata tuples used for this stitch.
+    """
+    if len(roi_tiles) <= 1:
+        return [(roi_tiles[0][0], roi_tiles)]
+
+    output_tif = f"{output_prefix}_stitched.tif"
+    reg_file = _stitch_roi_fiji(roi_tiles, output_tif, fix_white,
+                                keep_registered=True)
+
+    if reg_file is None:
+        print(f"  Warning: no registered positions — skipping split check")
+        return [(output_tif, roi_tiles)]
+
+    # Parse registered positions
+    reg_positions = parse_registered(reg_file)
+    os.remove(reg_file)
+
+    # Detect compression
+    compressed, ratio = detect_compression(reg_positions, roi_tiles,
+                                           tile_w, tile_h)
+
+    if not compressed:
+        print(f"  Canvas ratio {ratio:.2f} ≥ 0.85 — no compression detected")
+        return [(output_tif, roi_tiles)]
+
+    print(f"  Canvas ratio {ratio:.2f} < 0.85 — cross-section merge detected!")
+    print(f"  Running grid-consistency split...")
+
+    # Split using grid consistency
+    groups = grid_consistency_split(reg_positions, tile_w, tile_h)
+
+    if len(groups) <= 1:
+        print(f"  Grid-consistency produced only 1 group — keeping as-is")
+        return [(output_tif, roi_tiles)]
+
+    print(f"  Split into {len(groups)} groups: "
+          f"{[len(g) for g in groups]}")
+
+    # Map groups back to tile tuples
+    sub_rois = split_tiles_by_group(roi_tiles, groups)
+
+    # Remove the original stitched output (it's wrong)
+    if os.path.exists(output_tif):
+        os.remove(output_tif)
+
+    # Recursively stitch each sub-group
+    results = []
+    for gi, sub_roi in enumerate(sub_rois):
+        sub_prefix = f"{output_prefix}_g{gi}"
+        results.extend(
+            stitch_roi_recursive(sub_roi, sub_prefix, fix_white,
+                                 tile_w, tile_h)
+        )
+
+    return results
+
+
+def _stitch_roi_fiji(roi_tiles, output_tif, fix_white=False, keep_registered=False):
+    """Stitch a multi-tile ROI using Fiji.
+
+    Returns the path to TileConfiguration.registered.txt if keep_registered
+    is True, otherwise None.
+    """
     input_dir = os.path.dirname(os.path.abspath(roi_tiles[0][0]))
     config_path = os.path.join(input_dir, "TileConfiguration.txt")
     generate_tile_config(roi_tiles, config_path)
@@ -208,9 +273,13 @@ def _stitch_roi_fiji(roi_tiles, output_tif, fix_white=False):
     for f in [macro_file, config_path]:
         if os.path.exists(f):
             os.remove(f)
+
     reg_file = os.path.join(input_dir, "TileConfiguration.registered.txt")
+    if keep_registered and os.path.exists(reg_file):
+        return reg_file
     if os.path.exists(reg_file):
         os.remove(reg_file)
+    return None
 
 
 def download_assets():
@@ -463,18 +532,10 @@ def main():
         help="Pixel margin between ROIs after empty band collapse (default: 100)",
     )
     parser.add_argument(
-        "--cluster-threshold", type=float, default=2.0,
-        help="Distance multiplier for ROI clustering — N × tile diagonal "
-             "(default: 2.0)",
-    )
-    parser.add_argument(
-        "--backend",
-        default="fiji",
-        choices=["fiji", "numpy-fft"],
-        help="Overlap computation backend. 'fiji' uses ImageJ/Fiji "
-             "Grid/Collection stitching (requires Fiji on PATH). "
-             "'numpy-fft' uses pure-numpy phase correlation. "
-             "Default: fiji.",
+        "--overlap-margin", type=float, default=0.1,
+        help="Fraction of tile diagonal to expand bounding boxes for ROI "
+             "clustering (default: 0.1). Higher = more tolerant of stage "
+             "coordinate imprecision.",
     )
     parser.add_argument(
         "--fix-white-channel", action="store_true", default=True,
@@ -498,7 +559,7 @@ def main():
     print(f"Pixel size: {px_size:.4f} µm/px")
 
     # ── 2. Cluster into ROIs ────────────────────────────────────────
-    rois = cluster_tiles(tiles, args.cluster_threshold)
+    rois = cluster_tiles(tiles, args.overlap_margin)
     print(f"Detected {len(rois)} ROI(s):")
     for i, roi in enumerate(rois):
         print(f"  ROI {i}: {len(roi)} tile(s)")
@@ -508,29 +569,34 @@ def main():
     if fix_white:
         fix_white = check_white_channel(tiles[0][0])
 
-    # ── 4. Stitch each ROI ──────────────────────────────────────────
-    stitched_images = []
+    # ── 4. Stitch each ROI (with recursive split detection) ────────
+    tile_w = tiles[0][4]
+    tile_h = tiles[0][5]
+    stitched_results = []  # list of (image_path, tile_group)
     for i, roi in enumerate(rois):
         print(f"Processing ROI {i} ({len(roi)} tiles)...")
         if len(roi) == 1:
-            stitched_images.append(roi[0][0])
+            stitched_results.append((roi[0][0], roi))
             print(f"  Single tile — no stitching needed.")
         else:
-            output_tif = f"roi_{i}_stitched.tif"
-            stitch_roi(roi, output_tif, args.backend, fix_white)
-            stitched_images.append(output_tif)
-            print(f"  Stitched → {output_tif}")
+            results = stitch_roi_recursive(
+                roi, f"roi_{i}", fix_white, tile_w, tile_h
+            )
+            stitched_results.extend(results)
+            print(f"  → {len(results)} stitched image(s)")
+
+    stitched_images = [r[0] for r in stitched_results]
 
     # ── 5. Compute ROI positions in global coordinate space ─────────
     global_min_x = min(t[2] / t[1] for t in tiles)
     global_min_y = min(t[3] / t[1] for t in tiles)
 
     roi_bounds = []
-    for i, roi in enumerate(rois):
-        img = Image.open(stitched_images[i])
+    for img_path, tile_group in stitched_results:
+        img = Image.open(img_path)
         w, h = img.size
-        roi_min_x = min(t[2] / t[1] for t in roi) - global_min_x
-        roi_min_y = min(t[3] / t[1] for t in roi) - global_min_y
+        roi_min_x = min(t[2] / t[1] for t in tile_group) - global_min_x
+        roi_min_y = min(t[3] / t[1] for t in tile_group) - global_min_y
         roi_bounds.append((roi_min_x, roi_min_y, w, h))
 
     # ── 6. Compress layout (collapse empty bands) ───────────────────
@@ -544,7 +610,7 @@ def main():
 
     # ── 8. Cleanup intermediate stitched TIFFs ──────────────────────
     for img_path in stitched_images:
-        if img_path.startswith("roi_") and img_path.endswith("_stitched.tif"):
+        if img_path.startswith("roi_") and img_path.endswith(".tif"):
             if os.path.exists(img_path):
                 os.remove(img_path)
 

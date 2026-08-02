@@ -1,17 +1,17 @@
-"""Distance-based clustering of microscope tiles into ROIs."""
-
-import math
+"""Overlap-based clustering of microscope tiles into ROIs."""
 
 
-def cluster_tiles(tiles, threshold_multiplier=2.0):
-    """Group tiles into ROIs by spatial proximity.
+def cluster_tiles(tiles, overlap_margin=0.1):
+    """Group tiles into ROIs by bounding-box overlap.
 
-    Two tiles belong to the same ROI if their centre-to-centre distance
-    is less than threshold_multiplier × tile_diagonal.
+    Two tiles are considered adjacent (same ROI) when their
+    bounding boxes overlap, with a configurable margin to handle
+    small stage-coordinate imprecision.
 
     Args:
         tiles: List of (path, px_size, pos_x_um, pos_y_um, width_px, height_px).
-        threshold_multiplier: Multiplier for the tile diagonal distance.
+        overlap_margin: Fraction of tile diagonal to expand each bounding
+            box by before testing overlap (default 0.1).
 
     Returns:
         List of ROIs, each ROI is a list of tile tuples.
@@ -22,32 +22,33 @@ def cluster_tiles(tiles, threshold_multiplier=2.0):
     if n == 1:
         return [tiles]
 
-    # Compute tile centres in pixel coordinates and the tile diagonal
-    centres = []
+    # Compute pixel-space bounding boxes
     px_size = tiles[0][1]
-    w0, h0 = tiles[0][4], tiles[0][5]
-    tile_diagonal = math.sqrt(w0 ** 2 + h0 ** 2)
-    threshold = threshold_multiplier * tile_diagonal
+    margin_px = overlap_margin * (tiles[0][4] ** 2 + tiles[0][5] ** 2) ** 0.5
 
+    bboxes = []
     for t in tiles:
-        x_px = t[2] / px_size
-        y_px = t[3] / px_size
-        cx = x_px + t[4] / 2.0
-        cy = y_px + t[5] / 2.0
-        centres.append((cx, cy))
+        x0 = t[2] / px_size - margin_px
+        y0 = t[3] / px_size - margin_px
+        x1 = x0 + t[4] + 2 * margin_px
+        y1 = y0 + t[5] + 2 * margin_px
+        bboxes.append((x0, y0, x1, y1))
 
-    # Build adjacency graph
+    # Build adjacency graph from bounding-box intersection
     adj = {i: [] for i in range(n)}
     for i in range(n):
-        xi, yi = centres[i]
+        xi0, yi0, xi1, yi1 = bboxes[i]
         for j in range(i + 1, n):
-            xj, yj = centres[j]
-            dist = math.sqrt((xi - xj) ** 2 + (yi - yj) ** 2)
-            if dist < threshold:
+            xj0, yj0, xj1, yj1 = bboxes[j]
+            ox1 = max(xi0, xj0)
+            oy1 = max(yi0, yj0)
+            ox2 = min(xi1, xj1)
+            oy2 = min(yi1, yj1)
+            if ox1 < ox2 and oy1 < oy2:
                 adj[i].append(j)
                 adj[j].append(i)
 
-    # Find connected components (ROIs)
+    # Find connected components (ROIs) via DFS
     visited = set()
     rois = []
     for i in range(n):

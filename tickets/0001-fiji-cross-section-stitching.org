@@ -1,0 +1,100 @@
+#+TITLE: Fiji Grid/Collection Stitching merges tissue sections from different scan locations
+#+DATE: 2026-08-02
+#+TICKET: 0001
+#+STATUS: RESOLVED
+
+* Resolution
+
+Implemented grid-consistency split detection in ~microscope2html/grid_split.py~.
+
+The pipeline now:
+
+1. Stitches each ROI with Fiji as before.
+2. After stitching, compares registered canvas dimensions to
+   stage-coordinate-expected dimensions.  If the smaller axis ratio is
+   < 0.85, cross-section merging is flagged.
+3. Runs grid-consistency filtering on the registered overlap graph:
+   center-to-center distances are checked against expected grid spacing
+   (discovered from the bimodal distribution of all overlapping pairs).
+   Edges with distances in "dead zones" (e.g., dx ≈ 930 px — neither
+   same-column nor adjacent-column) are rejected as cross-section bridges.
+4. Connected components of the filtered graph become new sub-ROIs.
+5. Each sub-ROI is re-stitched with Fiji (recursively, in case of
+   nested over-merging).
+
+Tested on D28a Top Slide:
+- Original: 2 ROIs (61 + 101 tiles), ROI 1 had canvas ratio 0.84
+- After split: 3 ROIs (61 + 76 + 18), all clean
+- Output: 75 MB HTML with correct tissue separation
+
+* Original summary
+
+The overlap-based clustering in ~cluster_tiles~ groups tiles from
+*separate tissue sections* into a single ROI when their stage-coordinate
+bounding boxes overlap.  When sent to Fiji as one ROI, the
+Grid/Collection Stitching plugin computes pairwise phase-correlation
+alignments between tiles that happen to be adjacent in the adjacency
+graph but belong to different tissue sections.  This produces spurious
+but high-R pairwise matches that pull the sections into overlap.
+
+* Reproduction
+
+Test dataset: D28a Top Slide, 162 R-tiles.
+
+1. Overlap-based clustering produces 2 ROIs (61 + 101 tiles).
+2. The 101-tile ROI contains two tissue sections — joined by a 141 px
+   bounding-box overlap at two bridge points (tiles f146↔f154 and
+   f145↔f153).
+3. Fiji receives a TileConfiguration spanning 11441 × 31982 px (raw
+   stage coordinates, normalized).
+4. Fiji's pairwise phase-correlation aligns tiles across section
+   boundaries with R ≥ 0.99.
+5. The registered output (TC_debug.registered.txt) reveals that the
+   two sections overlap by 154 px in Y after registration:
+
+   | Section    | Tiles | Registered X       | Registered Y (bottom→top) |
+   |------------+-------+--------------------+---------------------------|
+   | Lower (G1) | 7     | 5663 → 11516       | −23632 → −19310           |
+   | Upper (G2) | 87    | −4772 → 11521      | −19464 → 4230             |
+
+   G2 extends 154 px below G1's top edge, creating a visible
+   overlap of ~0.048 mm (at 0.3086 µm/px) in the stitched output.
+
+* Root cause
+
+Fiji's Grid/Collection Stitching does not use stage coordinates as
+absolute positions.  It uses them only to determine which tile pairs
+to attempt pairwise alignment on.  The pairwise phase-correlation
+results between different tissue sections can produce high-R
+alignments that are spatially incorrect.  While Fiji detects *some*
+bad links (the log shows 3 links with R > 0.99 rejected), others
+survive and shift tiles by thousands of pixels during the global
+optimization phase.
+
+The per-tile displacement reported by Fiji (max 0.886 px) refers to
+the *final optimization* step, not the preceding pairwise alignment
+phase.  The pairwise phase is where the large (multi-kilopixel) tile
+repositioning actually occurs.
+
+* Scan protocol data
+
+The scanner (ThermoFisher EVOS M7000) writes a ~scan.scanprotocol~
+file alongside the TIFF exports.  For the Top Slide, this file defines
+4 Freeform scan locations, each as a polygon with a reference point:
+
+| Location      | Vertices | Reference Point (x, y µm)            |
+|---------------+----------+--------------------------------------|
+| Freeform_1    | 6        | (20184.28, −995.99)                  |
+| Freeform_2    | 8        | (16026.55, 903.99)                   |
+| Freeform_3    | 4        | (16147.33, −3799.60)                 |
+| Freeform_4    | 5        | (19909.79, −2581.60)                 |
+
+The TIFF files do *not* carry a scan location ID in their OME-XML
+metadata, so tiles cannot be directly assigned to a Freeform.
+
+* .stitch files
+
+Each TIFF has a companion ~.stitch~ file (4–10 MB binary).  These
+contain compressed image thumbnails (zlib header at offset 0x61) and
+possibly pre-computed alignment data from the scanner's internal
+stitching engine, but the format is undocumented.

@@ -34,6 +34,7 @@ Use these scopes in Conventional Commits:
 
 - `cli` — CLI entry point, argument parsing, output formatting
 - `stitch` — Tile configuration, ImageJ macro generation, Fiji invocation
+- `grid` — Grid-consistency split detection and ROI over-merge correction
 - `html` — OpenSeadragon viewer, HTML template, scalebar
 - `nix` — `flake.nix`, `flake.lock`, Nix-related changes
 - `docs` — README, AGENTS.md, or other documentation
