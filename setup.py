@@ -2,7 +2,7 @@ from setuptools import setup, find_packages
 
 setup(
     name="microscope2html",
-    version="0.1.0",
+    version="1.0.0",
     description="Stitch microscope tiles and generate a standalone HTML viewer",
     author="Your Name",
     author_email="your.email@example.com",

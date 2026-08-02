@@ -1,31 +1,44 @@
 #!/usr/bin/env python3
+"""microscope2html — Stitch microscope tiles and generate an HTML viewer.
+
+Usage:
+    microscope2html *.TIF [--output viewer.html] [--margin 100] [--cluster-threshold 2.0]
+"""
+
 import argparse
-import glob
-import os
-import sys
-import subprocess
-import tifffile
-import numpy as np
 import base64
 import io
-from PIL import Image
+import json
+import math
+import os
+import subprocess
+import sys
 import urllib.request
 import zipfile
-import shutil
-import math
-import json
 
-# Increase PIL limit for huge images
+import numpy as np
+import tifffile
+from PIL import Image
+
+from microscope2html.clustering import cluster_tiles
+from microscope2html.layout import compress_layout, compute_canvas_bounds
+from microscope2html.overlap import stitch_with_overlap
+
 Image.MAX_IMAGE_PIXELS = None
 
+
 def get_metadata(path):
-    """Extracts pixel size and stage position from OME-TIFF metadata."""
+    """Extract pixel size, stage position, and dimensions from OME-TIFF metadata.
+
+    Returns (px_size, pos_x_um, pos_y_um, width_px, height_px).
+    Raises ValueError if no stage PositionX/PositionY is found.
+    """
     with tifffile.TiffFile(path) as tif:
         ome_xml = tif.ome_metadata
         px_size = 1.0
-        pos_x = 0.0
-        pos_y = 0.0
-        
+        pos_x = None
+        pos_y = None
+
         if ome_xml:
             for line in ome_xml.splitlines():
                 if 'PhysicalSizeX="' in line:
@@ -43,46 +56,19 @@ def get_metadata(path):
                         pos_y = float(line.split('PositionY="')[1].split('"')[0])
                     except (IndexError, ValueError):
                         pass
-        
+
+        if pos_x is None or pos_y is None:
+            raise ValueError(
+                f"No stage coordinates (PositionX/PositionY) found in {path}"
+            )
+
         shape = tif.pages[0].shape
-        return px_size, pos_x, pos_y, shape
+        height, width = shape[0], shape[1]
+        return px_size, pos_x, pos_y, width, height
 
-def generate_tile_config(files, output_file="TileConfiguration.txt"):
-    """Generates the TileConfiguration.txt file for ImageJ."""
-    print(f"Generating {output_file} for {len(files)} tiles...")
-    
-    files_data = []
-    for file in files:
-        px_size, x_um, y_um, _ = get_metadata(file)
-        if px_size == 0: px_size = 1.0
-        x_px = x_um / px_size
-        y_px = y_um / px_size 
-        files_data.append((os.path.abspath(file), x_px, y_px))
-            
-    if not files_data:
-        print("Error: No file data collected.")
-        return False
-
-    min_x = min(d[1] for d in files_data)
-    min_y = min(d[2] for d in files_data)
-    
-    if not os.path.isabs(output_file):
-        output_dir = os.path.dirname(files_data[0][0])
-        output_path = os.path.join(output_dir, output_file)
-    else:
-        output_path = output_file
-
-    print(f"Writing configuration to {output_path}...")
-    with open(output_path, "w") as f:
-        f.write("dim = 2\n")
-        for file_path, x, y in files_data:
-            filename = os.path.basename(file_path)
-            f.write(f"{filename}; ; ({x - min_x:.2f}, {y - min_y:.2f})\n")
-            
-    return output_path
 
 def check_white_channel(file_path):
-    """Checks if the last channel is pure white."""
+    """Check if the last channel is pure white (common in EVOS exports)."""
     try:
         with tifffile.TiffFile(file_path) as tif:
             page = tif.pages[0]
@@ -90,132 +76,297 @@ def check_white_channel(file_path):
             if data.ndim == 3:
                 if data.shape[2] < data.shape[0] and data.shape[2] < data.shape[1]:
                     channels = data.shape[2]
-                    last_channel = data[:, :, channels-1]
+                    last_channel = data[:, :, channels - 1]
                 else:
                     channels = data.shape[0]
-                    last_channel = data[channels-1, :, :]
-                    
+                    last_channel = data[channels - 1, :, :]
+
                 if channels >= 4:
                     mean_val = np.mean(last_channel)
                     if mean_val > 250:
-                        print(f"Detected white channel at index {channels-1} (mean {mean_val:.2f}). Will discard.")
+                        print(
+                            f"Detected white channel at index {channels - 1} "
+                            f"(mean {mean_val:.2f}). Will discard."
+                        )
                         return True
     except Exception as e:
         print(f"Warning: Could not check channels: {e}")
     return False
 
-def generate_macro(output_macro, tile_config, output_image, input_dir, compute_overlap, fix_white_channel):
-    """Generates the ImageJ macro."""
-    overlap_param = "compute_overlap" if compute_overlap else ""
+
+def generate_tile_config(tiles, output_file):
+    """Generate TileConfiguration.txt for a single ROI."""
+    files_data = []
+    for t in tiles:
+        path, px_size, x_um, y_um, _w, _h = t
+        if px_size == 0:
+            px_size = 1.0
+        x_px = x_um / px_size
+        y_px = y_um / px_size
+        files_data.append((os.path.abspath(path), x_px, y_px))
+
+    min_x = min(d[1] for d in files_data)
+    min_y = min(d[2] for d in files_data)
+
+    with open(output_file, "w") as f:
+        f.write("dim = 2\n")
+        for file_path, x, y in files_data:
+            filename = os.path.basename(file_path)
+            f.write(f"{filename}; ; ({x - min_x:.2f}, {y - min_y:.2f})\n")
+
+    return output_file
+
+
+def generate_macro(output_macro, tile_config, output_image, input_dir,
+                   fix_white_channel):
+    """Generate an ImageJ macro for stitching a single ROI."""
     input_dir = os.path.abspath(input_dir)
-    
-    macro_content = f"""
-run("Grid/Collection stitching", "type=[Positions from file] order=[Defined by TileConfiguration] directory=[{input_dir}] layout_file={tile_config} fusion_method=[Linear Blending] regression_threshold=0.30 max/avg_displacement_threshold=2.50 absolute_displacement_threshold=3.50 {overlap_param} computation_parameters=[Save memory (but be slower)] image_output=[Fuse and display]");
+    output_image = os.path.abspath(output_image)
+
+    macro = f"""
+run("Grid/Collection stitching", "type=[Positions from file] \
+order=[Defined by TileConfiguration] \
+directory=[{input_dir}] \
+layout_file={tile_config} \
+fusion_method=[Linear Blending] \
+regression_threshold=0.30 \
+max/avg_displacement_threshold=2.50 \
+absolute_displacement_threshold=3.50 \
+compute_overlap \
+computation_parameters=[Save memory (but be slower)] \
+image_output=[Fuse and display]");
 """
+
     if fix_white_channel:
-        macro_content += """
+        macro += """
 run("Split Channels");
 if (isOpen("C4-Fused")) { selectWindow("C4-Fused"); close(); }
 run("Merge Channels...", "c1=C1-Fused c2=C2-Fused c3=C3-Fused create");
 """
-    macro_content += f"""
+
+    macro += f"""
 run("RGB Color");
-saveAs("Tiff", "{os.path.abspath(output_image)}");
+saveAs("Tiff", "{output_image}");
 eval("script", "System.exit(0);");
 """
     with open(output_macro, "w") as f:
-        f.write(macro_content)
+        f.write(macro)
+
+
+FIJI_DIR = os.environ.get("FIJI_DIR", "/tmp/fiji/Fiji")
+FIJI_CMD = os.path.join(FIJI_DIR, "fiji") if os.path.isdir(FIJI_DIR) else "fiji"
+
+
+def _fiji_available():
+    """Check if Fiji is available."""
+    try:
+        subprocess.run(
+            [FIJI_CMD, "--headless", "--version"],
+            capture_output=True, timeout=10
+        )
+        return True
+    except (FileNotFoundError, subprocess.TimeoutExpired):
+        return False
+
+
+def stitch_roi(roi_tiles, output_tif, backend, fix_white=False):
+    """Stitch a multi-tile ROI using the specified backend.
+
+    Args:
+        backend: ``"fiji"`` (default) or ``"numpy-fft"``.
+        fix_white: (Fiji only) discard a spurious white channel.
+    """
+    if backend == "fiji":
+        if not _fiji_available():
+            print("Error: Fiji backend selected but Fiji is not available.",
+                  file=sys.stderr)
+            print("  Install Fiji or use --backend numpy-fft", file=sys.stderr)
+            sys.exit(1)
+        _stitch_roi_fiji(roi_tiles, output_tif, fix_white)
+    elif backend == "numpy-fft":
+        stitch_with_overlap(roi_tiles, output_tif)
+    else:
+        print(f"Error: unknown backend '{backend}'", file=sys.stderr)
+        sys.exit(1)
+
+
+def _stitch_roi_fiji(roi_tiles, output_tif, fix_white=False):
+    """Stitch a multi-tile ROI using Fiji."""
+    input_dir = os.path.dirname(os.path.abspath(roi_tiles[0][0]))
+    config_path = os.path.join(input_dir, "TileConfiguration.txt")
+    generate_tile_config(roi_tiles, config_path)
+
+    macro_file = "stitch_tiles.ijm"
+    config_name = os.path.basename(config_path)
+    generate_macro(macro_file, config_name, output_tif, input_dir, fix_white)
+
+    print(f"  Running Fiji for {len(roi_tiles)} tiles...")
+    cmd = [FIJI_CMD, "--headless", "--console", "-macro", macro_file]
+    subprocess.run(cmd, check=True)
+
+    # Cleanup intermediate files
+    for f in [macro_file, config_path]:
+        if os.path.exists(f):
+            os.remove(f)
+    reg_file = os.path.join(input_dir, "TileConfiguration.registered.txt")
+    if os.path.exists(reg_file):
+        os.remove(reg_file)
+
 
 def download_assets():
-    """Downloads OpenSeadragon assets if missing."""
+    """Download OpenSeadragon and scalebar plugin if missing."""
     if not os.path.exists("openseadragon-bin-5.0.0"):
         print("Downloading OpenSeadragon...")
         try:
-            urllib.request.urlretrieve("https://github.com/openseadragon/openseadragon/releases/download/v5.0.0/openseadragon-bin-5.0.0.zip", "osd.zip")
-            with zipfile.ZipFile("osd.zip", 'r') as zip_ref:
+            urllib.request.urlretrieve(
+                "https://github.com/openseadragon/openseadragon/releases/"
+                "download/v5.0.0/openseadragon-bin-5.0.0.zip",
+                "osd.zip",
+            )
+            with zipfile.ZipFile("osd.zip", "r") as zip_ref:
                 zip_ref.extractall(".")
             os.remove("osd.zip")
         except Exception as e:
-            print(f"Error downloading OSD: {e}")
-        
+            print(f"Error downloading OpenSeadragon: {e}")
+            sys.exit(1)
+
     if not os.path.exists("openseadragon-scalebar.js"):
         print("Downloading Scalebar plugin...")
         try:
-            urllib.request.urlretrieve("https://raw.githubusercontent.com/usnistgov/OpenSeadragonScalebar/master/openseadragon-scalebar.js", "openseadragon-scalebar.js")
+            urllib.request.urlretrieve(
+                "https://raw.githubusercontent.com/usnistgov/"
+                "OpenSeadragonScalebar/master/openseadragon-scalebar.js",
+                "openseadragon-scalebar.js",
+            )
         except Exception as e:
             print(f"Error downloading Scalebar: {e}")
+            sys.exit(1)
 
-def create_tiled_html(image_path, output_html, pixel_size_um):
-    """Creates a standalone HTML viewer with embedded tile pyramid."""
-    print(f"Generating tile pyramid for {image_path}...")
-    download_assets()
-    
-    # Open Image
-    try:
-        img = Image.open(image_path)
-        if img.mode != 'RGB':
-            img = img.convert('RGB')
-    except Exception as e:
-        print(f"Failed to open image: {e}")
-        return
+
+def generate_dzi_tiles(image_path):
+    """Generate a DZI tile pyramid from a stitched image.
+
+    Returns (tiles_dict, width, height, max_level).
+    """
+    img = Image.open(image_path)
+    if img.mode != "RGB":
+        img = img.convert("RGB")
 
     width, height = img.size
-    print(f"Original Size: {width}x{height}")
-    
-    # Calculate Max Level
-    max_dim = max(width, height)
-    max_level = int(math.ceil(math.log(max_dim, 2)))
-    print(f"Max Level: {max_level}")
-    
+    max_level = int(math.ceil(math.log(max(width, height), 2)))
     tiles = {}
     tile_size = 256
-    
-    # Generate tiles for each level
     current_img = img
-    
-    # We iterate from Max Level down to 0
+
     for level in range(max_level, -1, -1):
-        print(f"Processing Level {level} ({current_img.size[0]}x{current_img.size[1]})...")
-        cols = int(math.ceil(current_img.size[0] / tile_size))
-        rows = int(math.ceil(current_img.size[1] / tile_size))
-        
+        lvl_w, lvl_h = current_img.size
+        cols = int(math.ceil(lvl_w / tile_size))
+        rows = int(math.ceil(lvl_h / tile_size))
+
         for col in range(cols):
             for row in range(rows):
-                # Crop
                 left = col * tile_size
                 top = row * tile_size
-                right = min(left + tile_size, current_img.size[0])
-                bottom = min(top + tile_size, current_img.size[1])
-                
+                right = min(left + tile_size, lvl_w)
+                bottom = min(top + tile_size, lvl_h)
                 tile = current_img.crop((left, top, right, bottom))
-                
-                # Save to base64
-                buffer = io.BytesIO()
-                tile.save(buffer, format="JPEG", quality=75)
-                b64 = base64.b64encode(buffer.getvalue()).decode("utf-8")
-                
+                buf = io.BytesIO()
+                tile.save(buf, format="JPEG", quality=75)
+                b64 = base64.b64encode(buf.getvalue()).decode("utf-8")
                 key = f"{level}/{col}_{row}"
                 tiles[key] = f"data:image/jpeg;base64,{b64}"
-        
-        # Prepare next level (downsample)
+
         if level > 0:
-            new_w = max(1, current_img.size[0] // 2)
-            new_h = max(1, current_img.size[1] // 2)
+            new_w = max(1, lvl_w // 2)
+            new_h = max(1, lvl_h // 2)
             current_img = current_img.resize((new_w, new_h), Image.Resampling.BILINEAR)
 
-    print(f"Total tiles generated: {len(tiles)}")
+    return tiles, width, height, max_level
 
-    # Read Scripts
-    try:
-        with open("openseadragon-bin-5.0.0/openseadragon.min.js", "r") as f:
-            osd_script = f.read()
-        with open("openseadragon-scalebar.js", "r") as f:
-            scalebar_script = f.read()
-    except FileNotFoundError:
-        print("Error: OSD scripts not found.")
-        return
 
-    # Embed Icons
+def composite_rois(stitched_images, positions):
+    """Paste all stitched ROI images into a single composite canvas.
+
+    Returns path to the composite TIFF, or None if compositing fails.
+    """
+    # Determine canvas bounds
+    roi_bounds = []
+    for i, img_path in enumerate(stitched_images):
+        img = Image.open(img_path)
+        w, h = img.size
+        nx, ny = positions[i]
+        roi_bounds.append((int(nx), int(ny), w, h))
+
+    canvas_w, canvas_h = compute_canvas_bounds(
+        roi_bounds, [(b[0], b[1]) for b in roi_bounds]
+    )
+
+    print(f"Compositing {len(stitched_images)} ROIs onto {canvas_w}×{canvas_h} px canvas...")
+
+    composite = Image.new("RGB", (canvas_w, canvas_h), (0, 0, 0))
+
+    for i, img_path in enumerate(stitched_images):
+        x, y, w, h = roi_bounds[i]
+        roi_img = Image.open(img_path)
+        if roi_img.mode != "RGB":
+            roi_img = roi_img.convert("RGB")
+        composite.paste(roi_img, (x, y))
+
+    composite_path = "_composite.tif"
+    composite.save(composite_path)
+    print(f"  Saved composite → {composite_path}")
+    return composite_path
+
+
+def create_tiled_html_single(image_path, output_html, pixel_size_um):
+    """Create a standalone HTML viewer with a single embedded DZI tile pyramid."""
+    print(f"Generating tile pyramid for {os.path.basename(image_path)}...")
+    download_assets()
+
+    img = Image.open(image_path)
+    if img.mode != "RGB":
+        img = img.convert("RGB")
+
+    width, height = img.size
+    max_level = int(math.ceil(math.log(max(width, height), 2)))
+    print(f"  Size: {width}×{height}, max level: {max_level}")
+
+    tiles = {}
+    tile_size = 256
+    current_img = img
+
+    for level in range(max_level, -1, -1):
+        lvl_w, lvl_h = current_img.size
+        cols = int(math.ceil(lvl_w / tile_size))
+        rows = int(math.ceil(lvl_h / tile_size))
+
+        for col in range(cols):
+            for row in range(rows):
+                left = col * tile_size
+                top = row * tile_size
+                right = min(left + tile_size, lvl_w)
+                bottom = min(top + tile_size, lvl_h)
+                tile = current_img.crop((left, top, right, bottom))
+                buf = io.BytesIO()
+                tile.save(buf, format="JPEG", quality=75)
+                b64 = base64.b64encode(buf.getvalue()).decode("utf-8")
+                key = f"{level}/{col}_{row}"
+                tiles[key] = f"data:image/jpeg;base64,{b64}"
+
+        if level > 0:
+            new_w = max(1, lvl_w // 2)
+            new_h = max(1, lvl_h // 2)
+            current_img = current_img.resize((new_w, new_h), Image.Resampling.BILINEAR)
+
+    print(f"  Total DZI tiles: {len(tiles)}")
+
+    # Read OSD scripts
+    with open("openseadragon-bin-5.0.0/openseadragon.min.js") as f:
+        osd_script = f.read()
+    with open("openseadragon-scalebar.js") as f:
+        scalebar_script = f.read()
+
+    # Embed icons
     icon_prefix = "openseadragon-bin-5.0.0/images/"
     icons = {}
     if os.path.exists(icon_prefix):
@@ -224,8 +375,10 @@ def create_tiled_html(image_path, output_html, pixel_size_um):
                 with open(os.path.join(icon_prefix, icon_name), "rb") as f:
                     b64 = base64.b64encode(f.read()).decode("utf-8")
                     icons[icon_name] = f"data:image/png;base64,{b64}"
-    
-    html_content = f"""<!DOCTYPE html>
+
+    ppm = 1000000 / pixel_size_um if pixel_size_um > 0 else 1
+
+    html = f"""<!DOCTYPE html>
 <html>
 <head>
     <meta charset="utf-8">
@@ -246,20 +399,20 @@ def create_tiled_html(image_path, output_html, pixel_size_um):
     <script>
         var icons = {json.dumps(icons)};
         var tiles = {json.dumps(tiles)};
-        
+
         var navImages = {{
-            zoomIn: {{ REST: icons['zoomin_rest.png'], GROUP: icons['zoomin_grouphover.png'], HOVER: icons['zoomin_hover.png'], DOWN: icons['zoomin_pressed.png'] }},
-            zoomOut: {{ REST: icons['zoomout_rest.png'], GROUP: icons['zoomout_grouphover.png'], HOVER: icons['zoomout_hover.png'], DOWN: icons['zoomout_pressed.png'] }},
-            home: {{ REST: icons['home_rest.png'], GROUP: icons['home_grouphover.png'], HOVER: icons['home_hover.png'], DOWN: icons['home_pressed.png'] }},
-            fullpage: {{ REST: icons['fullpage_rest.png'], GROUP: icons['fullpage_grouphover.png'], HOVER: icons['fullpage_hover.png'], DOWN: icons['fullpage_pressed.png'] }},
-            rotateleft: {{ REST: icons['rotateleft_rest.png'], GROUP: icons['rotateleft_grouphover.png'], HOVER: icons['rotateleft_hover.png'], DOWN: icons['rotateleft_pressed.png'] }},
+            zoomIn:      {{ REST: icons['zoomin_rest.png'],      GROUP: icons['zoomin_grouphover.png'],      HOVER: icons['zoomin_hover.png'],      DOWN: icons['zoomin_pressed.png'] }},
+            zoomOut:     {{ REST: icons['zoomout_rest.png'],     GROUP: icons['zoomout_grouphover.png'],     HOVER: icons['zoomout_hover.png'],     DOWN: icons['zoomout_pressed.png'] }},
+            home:        {{ REST: icons['home_rest.png'],        GROUP: icons['home_grouphover.png'],        HOVER: icons['home_hover.png'],        DOWN: icons['home_pressed.png'] }},
+            fullpage:    {{ REST: icons['fullpage_rest.png'],    GROUP: icons['fullpage_grouphover.png'],    HOVER: icons['fullpage_hover.png'],    DOWN: icons['fullpage_pressed.png'] }},
+            rotateleft:  {{ REST: icons['rotateleft_rest.png'],  GROUP: icons['rotateleft_grouphover.png'],  HOVER: icons['rotateleft_hover.png'],  DOWN: icons['rotateleft_pressed.png'] }},
             rotateright: {{ REST: icons['rotateright_rest.png'], GROUP: icons['rotateright_grouphover.png'], HOVER: icons['rotateright_hover.png'], DOWN: icons['rotateright_pressed.png'] }},
-            flip: {{ REST: icons['flip_rest.png'], GROUP: icons['flip_grouphover.png'], HOVER: icons['flip_hover.png'], DOWN: icons['flip_pressed.png'] }},
+            flip:        {{ REST: icons['flip_rest.png'],        GROUP: icons['flip_grouphover.png'],        HOVER: icons['flip_hover.png'],        DOWN: icons['flip_pressed.png'] }},
         }};
 
         var viewer = OpenSeadragon({{
             id: "openseadragon1",
-            prefixUrl: "", 
+            prefixUrl: "",
             navImages: navImages,
             tileSources: {{
                 width: {width},
@@ -274,9 +427,9 @@ def create_tiled_html(image_path, output_html, pixel_size_um):
                 }}
             }}
         }});
-        
+
         viewer.scalebar({{
-            pixelsPerMeter: {1000000 / pixel_size_um if pixel_size_um > 0 else 1},
+            pixelsPerMeter: {ppm},
             xOffset: 10,
             yOffset: 10,
             barThickness: 3,
@@ -289,84 +442,114 @@ def create_tiled_html(image_path, output_html, pixel_size_um):
 </html>
 """
     with open(output_html, "w") as f:
-        f.write(html_content)
+        f.write(html)
     print(f"Saved standalone HTML to {output_html}")
 
-def main():
-    parser = argparse.ArgumentParser(description="Stitch TIFF tiles and generate HTML viewer.")
-    parser.add_argument("--input_dir", default=".", help="Directory containing TIFF tiles")
-    parser.add_argument("--pattern", default="*M*d0.TIF", help="Glob pattern for tile filenames")
-    parser.add_argument("--output", default="stitched_viewer.html", help="Output filename (HTML)")
-    parser.add_argument("--no_overlap", action="store_true", help="Force disable overlap computation")
-    parser.add_argument("--fix_white_channel", action="store_true", default=True, help="Discard 4th white channel if detected (default: True)")
-    parser.add_argument("--skip_stitching", action="store_true", help="Skip stitching if output TIFF already exists")
-    
-    args = parser.parse_args()
-    
-    if not args.output.lower().endswith(".html"):
-        output_tif = args.output + ".tif"
-        output_html = args.output + ".html" 
-    else:
-        output_tif = args.output.replace(".html", ".tif")
-        output_html = args.output
-        
-    search_path = os.path.join(args.input_dir, args.pattern)
-    files = sorted(glob.glob(search_path))
-    
-    if not files:
-        print(f"No files found matching {search_path}")
-        sys.exit(1)
-        
-    print(f"Found {len(files)} tiles.")
-    
-    should_stitch = True
-    if args.skip_stitching and os.path.exists(output_tif):
-        print(f"Output TIFF {output_tif} exists. Skipping stitching.")
-        should_stitch = False
-        
-    if should_stitch:
-        config_filename = "TileConfiguration.txt"
-        config_path = generate_tile_config(files, config_filename)
-        if not config_path:
-            sys.exit(1)
-            
-        config_file_for_macro = os.path.basename(config_path)
-        
-        if args.no_overlap:
-            compute_overlap = False
-        else:
-            compute_overlap = True
-            
-        fix_white = args.fix_white_channel
-        if fix_white:
-            fix_white = check_white_channel(files[0])
-            
-        macro_file = "stitch_tiles.ijm"
-        generate_macro(macro_file, config_file_for_macro, output_tif, args.input_dir, compute_overlap, fix_white)
-        
-        print("Running Fiji...")
-        cmd = ["fiji", "--headless", "--console", "-macro", macro_file]
-        
-        try:
-            subprocess.run(cmd, check=True)
-            print(f"\nStitching complete. Output saved to {output_tif}")
-        except subprocess.CalledProcessError as e:
-            print(f"\nError running Fiji: {e}")
-            sys.exit(1)
-            
-        for f in [macro_file, config_path]:
-            if os.path.exists(f):
-                os.remove(f)
-        reg_file = os.path.join(os.path.dirname(config_path), "TileConfiguration.registered.txt")
-        if os.path.exists(reg_file):
-            os.remove(reg_file)
 
-    if os.path.exists(output_tif):
-        px_size, _, _, _ = get_metadata(files[0])
-        create_tiled_html(output_tif, output_html, px_size)
-    else:
-        print("Error: Stitched TIFF not found.")
-        sys.exit(1)
+def main():
+    parser = argparse.ArgumentParser(
+        description="Stitch microscope TIFF tiles and generate an HTML viewer."
+    )
+    parser.add_argument(
+        "files", nargs="+",
+        help="OME-TIFF tile files with stage coordinate metadata",
+    )
+    parser.add_argument(
+        "--output", "-o", default="stitched_viewer.html",
+        help="Output HTML filename (default: stitched_viewer.html)",
+    )
+    parser.add_argument(
+        "--margin", type=int, default=100,
+        help="Pixel margin between ROIs after empty band collapse (default: 100)",
+    )
+    parser.add_argument(
+        "--cluster-threshold", type=float, default=2.0,
+        help="Distance multiplier for ROI clustering — N × tile diagonal "
+             "(default: 2.0)",
+    )
+    parser.add_argument(
+        "--backend",
+        default="fiji",
+        choices=["fiji", "numpy-fft"],
+        help="Overlap computation backend. 'fiji' uses ImageJ/Fiji "
+             "Grid/Collection stitching (requires Fiji on PATH). "
+             "'numpy-fft' uses pure-numpy phase correlation. "
+             "Default: fiji.",
+    )
+    parser.add_argument(
+        "--fix-white-channel", action="store_true", default=True,
+        help="Discard 4th white channel if detected (default: True)",
+    )
+
+    args = parser.parse_args()
+
+    # ── 1. Extract metadata from all tiles ──────────────────────────
+    print(f"Reading metadata from {len(args.files)} files...")
+    tiles = []
+    for f in args.files:
+        try:
+            meta = get_metadata(f)
+            tiles.append((f,) + meta)
+        except ValueError as e:
+            print(f"Error: {e}", file=sys.stderr)
+            sys.exit(1)
+
+    px_size = tiles[0][1]
+    print(f"Pixel size: {px_size:.4f} µm/px")
+
+    # ── 2. Cluster into ROIs ────────────────────────────────────────
+    rois = cluster_tiles(tiles, args.cluster_threshold)
+    print(f"Detected {len(rois)} ROI(s):")
+    for i, roi in enumerate(rois):
+        print(f"  ROI {i}: {len(roi)} tile(s)")
+
+    # ── 3. White-channel detection ──────────────────────────────────
+    fix_white = args.fix_white_channel
+    if fix_white:
+        fix_white = check_white_channel(tiles[0][0])
+
+    # ── 4. Stitch each ROI ──────────────────────────────────────────
+    stitched_images = []
+    for i, roi in enumerate(rois):
+        print(f"Processing ROI {i} ({len(roi)} tiles)...")
+        if len(roi) == 1:
+            stitched_images.append(roi[0][0])
+            print(f"  Single tile — no stitching needed.")
+        else:
+            output_tif = f"roi_{i}_stitched.tif"
+            stitch_roi(roi, output_tif, args.backend, fix_white)
+            stitched_images.append(output_tif)
+            print(f"  Stitched → {output_tif}")
+
+    # ── 5. Compute ROI positions in global coordinate space ─────────
+    global_min_x = min(t[2] / t[1] for t in tiles)
+    global_min_y = min(t[3] / t[1] for t in tiles)
+
+    roi_bounds = []
+    for i, roi in enumerate(rois):
+        img = Image.open(stitched_images[i])
+        w, h = img.size
+        roi_min_x = min(t[2] / t[1] for t in roi) - global_min_x
+        roi_min_y = min(t[3] / t[1] for t in roi) - global_min_y
+        roi_bounds.append((roi_min_x, roi_min_y, w, h))
+
+    # ── 6. Compress layout (collapse empty bands) ───────────────────
+    positions = compress_layout(roi_bounds, args.margin)
+
+    # ── 7. Composite all ROIs into one image, then generate HTML ────
+    composite_path = composite_rois(stitched_images, positions)
+    if composite_path:
+        create_tiled_html_single(composite_path, args.output, px_size)
+        os.remove(composite_path)
+
+    # ── 8. Cleanup intermediate stitched TIFFs ──────────────────────
+    for img_path in stitched_images:
+        if img_path.startswith("roi_") and img_path.endswith("_stitched.tif"):
+            if os.path.exists(img_path):
+                os.remove(img_path)
+
+    print("Done.")
+
 
 if __name__ == "__main__":
     main()
