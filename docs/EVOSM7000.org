@@ -1,0 +1,244 @@
+#+TITLE: EVOS M7000 File Naming & Metadata Reference
+#+DATE: 2026-08-03
+#+OPTIONS: toc:2
+
+* Overview
+
+The EVOS M7000 microscope produces the following output files when
+acquiring tiled scans with on-instrument stitching enabled:
+
+| File type          | Suffix           | Content                                      |
+|--------------------+------------------+----------------------------------------------|
+| Raw tile           | =.TIF=           | Individual field-of-view image               |
+| Raw tile metadata  | =.stitch=        | Binary blob with stage coordinates           |
+| Stitched image     | =.TIF=           | Full ROI mosaic (=TM= = Tile Map)            |
+| Scan protocol      | =.scanprotocol=  | XML describing scan setup (ROIs, channels)   |
+
+There is no separate =.stitch= file for stitched TM images.
+
+* File Naming Convention
+
+Filename pattern:
+: scan_<SlideName>_<Type>_p<pass>_<well>_A<area>f<field>d<channel>.TIF
+
+| Component | Meaning                                                    |
+|-----------+------------------------------------------------------------|
+| SlideName | Vessel/slide name assigned in software                     |
+| Type      | =R= (Raw tile) or =TM= (Tile Map / stitched)               |
+| p         | Pass number (=00= for single-pass scans)                   |
+| well idx  | Well/sub-position index (=0= for slides)                   |
+| A         | Area grid index (=01= for slides)                          |
+| f         | Field identifier: sequential acquisition order, not ROI ID |
+| d         | Channel index: =0= merged/default, =N= channel N           |
+
+*Channel numbering* (from scanprotocol =<FilterConfiguration>= tags):
+| Index | Channel name | Detection mode | Filter  |
+|-------+--------------+----------------+---------|
+|     0 | DAPI         | Fluorescence   | DAPI    |
+|     1 | GFP          | Fluorescence   | GFP     |
+|     2 | RFP          | Fluorescence   | RFP     |
+|     3 | CY5          | Fluorescence   | CY5     |
+|     4 | Trans        | Transmitted    | Trans   |
+
+Which channels are actually captured is controlled by the
+=<Capture>true</Capture>= or =<Capture>false</Capture>= element for
+each channel in the scanprotocol. Raw tiles are suffixed with the
+channel index (=d4= for Transmitted, =d0= for DAPI, etc.). Stitched
+TM images always use =d0= (merged/default).
+
+* TIF Files: OME-XML Metadata
+
+Every TIF file (both raw and stitched) embeds OME-XML metadata in the
+=ImageDescription= TIFF tag. This is the authoritative source of
+spatial information.
+
+** Raw tile TIF
+
+#+begin_src xml
+<Image ID="Image:" Name="Trans">
+  <Pixels SizeX="2048" SizeY="1536"
+          PhysicalSizeX="<µm/px>" PhysicalSizeY="<µm/px>"
+          PhysicalSizeZ="<µm/slice>"
+          DimensionOrder="XYZCT" Type="uint24">
+    <Channel ID="Channel:d<N>" SamplesPerPixel="1" />
+    <Plane TheZ="0" TheC="<channel>" TheT="0"
+           ExposureTime="<s>" ExposureTimeUnit="s"
+           PositionX="<µm>" PositionY="<µm>" PositionZ="<µm>"
+           ActualPositionX="<µm>" ActualPositionY="<µm>"
+           ActualPositionZ="<µm>" />
+  </Pixels>
+</Image>
+#+end_src
+
+Key fields:
+- =PositionX, PositionY, PositionZ= :: nominal stage coordinates of the
+  tile center (µm). These reflect the planned scan grid.
+- =ActualPositionX, ActualPositionY, ActualPositionZ= :: real stage
+  position after focus adjustment. =ActualPositionZ= includes the
+  autofocus offset and typically differs from =PositionZ=.
+- =PhysicalSizeX, PhysicalSizeY= :: pixel size in µm (depends on
+  objective; e.g. ~0.309 µm/px for 10× on the EVOS M7000).
+- =PhysicalSizeZ= :: Z-step in µm (non-zero for raw tiles; =0= in
+  stitched TM).
+- =SizeX=, =SizeY= :: image dimensions in pixels.
+- =TheC= :: channel index (matches the =d<N>= file suffix).
+- =ExposureTime= :: exposure duration in seconds.
+- =Name= :: ="Trans"= for transmitted-light raw tiles; channel-specific
+  names for fluorescence.
+
+** Stitched TM TIF
+
+#+begin_src xml
+<Image ID="Image:" Name="Merged">
+  <Pixels SizeX="<W>" SizeY="<H>"
+          PhysicalSizeX="<µm/px>" PhysicalSizeY="<µm/px>"
+          PhysicalSizeZ="0"
+          DimensionOrder="XYZCT" Type="uint24">
+    <Channel ID="Channel:d0" SamplesPerPixel="1" />
+    <Plane TheZ="0" TheC="0" TheT="0"
+           PositionX="<µm>" PositionY="<µm>" PositionZ="<µm>" />
+  </Pixels>
+</Image>
+#+end_src
+
+Differences from raw tiles:
+- =Name="Merged"= instead of =Name="Trans"= or channel-specific name.
+- =TheC="0"= (merged/default channel).
+- =SizeX=, =SizeY= reflect the full stitched mosaic dimensions.
+- =PhysicalSizeZ="0"= (no Z dimension in stitched output).
+- =ActualPosition*= fields may or may not be present; when present they
+  duplicate =Position*=.
+
+**.stitch Files**
+
+Each raw tile has a companion =.stitch= binary file (~1–10 MB,
+containing a JPEG preview) with a compact binary header:
+
+#+begin_src python
+import struct
+
+def parse_stitch_header(path):
+    with open(path, 'rb') as f:
+        data = f.read(100)
+    version  = struct.unpack_from('<I', data,  0)[0]  # varies
+    nitems   = struct.unpack_from('<I', data,  4)[0]  # typically 3
+    flag     = struct.unpack_from('<i', data,  8)[0]  # typically -1
+    x        = struct.unpack_from('<d', data, 12)[0]  # stage X (µm)
+    y        = struct.unpack_from('<d', data, 20)[0]  # stage Y (µm)
+    z        = struct.unpack_from('<d', data, 28)[0]  # stage Z (µm)
+    return x, y, z
+#+end_src
+
+*Note:* The =.stitch= coordinates are approximate — they tend to
+reflect the stitched mosaic position rather than the individual raw
+tile position from the OME-XML. Always prefer the TIF OME-XML
+=PositionX=/=PositionY= for accurate per-tile spatial data.
+
+* Mapping Tiles to ROIs
+
+The scanprotocol defines Regions of Interest (ROIs) as
+=customLocationShapes=. ROIs can be rectangular (with a
+=ReferencePoint= and =Extents= defining half-width/half-height) or
+freeform polygons (defined by a list of =Point= vertices). Each ROI is
+assigned to a vessel (slide) under =VesselHolderAndAreas= and has a
+=LocationName=, a =LocationNumber=, and a =LocationType= (=Custom= or
+=Rectangular=).
+
+** Tile-to-ROI Classification
+
+A tile belongs to an ROI if its (=PositionX=, =PositionY=) from the
+TIF OME-XML falls within the ROI's bounding shape. For rectangular
+ROIs:
+
+\[
+|\text{PositionX} - \text{RefPointX}| \leq \text{ExtentW}
+\quad\text{and}\quad
+|\text{PositionY} - \text{RefPointY}| \leq \text{ExtentH}
+\]
+
+For freeform polygon ROIs, use a point-in-polygon test against the
+extent vertices.
+
+** Scan Pattern
+
+The scan pattern is defined by =AreaSequencePattern= in the
+scanprotocol (typically =SerpentineHorizontal=). Tiles are acquired in
+a raster within each ROI, with adjacent columns scanned in opposite
+directions. Tile overlap (controlled by =MinOverlapPixels= in the
+scanprotocol) ensures seamless stitching.
+
+The =fNN= field number in the filename is a sequential acquisition
+order across all tiles in the vessel, not an ROI identifier. ROI
+membership must be determined by comparing tile positions against the
+scanprotocol ROI definitions.
+
+* Parsing OME-XML from TIF Files in Python
+
+#+begin_src python
+import subprocess
+import xml.etree.ElementTree as ET
+import re
+
+def get_tile_metadata(tif_path):
+    """Extract OME-XML metadata from an EVOS M7000 TIF file."""
+    result = subprocess.run(
+        ['tiffinfo', tif_path],
+        capture_output=True, text=True
+    )
+    # Extract the OME-XML block from ImageDescription
+    match = re.search(
+        r'ImageDescription:\s*(<\?xml.+?</OME>)',
+        result.stdout, re.DOTALL
+    )
+    if not match:
+        return None
+    return ET.fromstring(match.group(1))
+
+def get_plane_info(tif_path):
+    """Get position, channel, exposure for a single-plane TIF."""
+    root = get_tile_metadata(tif_path)
+    if root is None:
+        return None
+    # Use unprefixed XPath — ElementTree strips the default namespace
+    plane  = root.find('.//Plane')
+    pixels = root.find('.//Pixels')
+    image  = root.find('.//Image')
+    if plane is None or pixels is None:
+        return None
+    return {
+        'image_name':    image.get('Name'),
+        'size_x':        int(pixels.get('SizeX')),
+        'size_y':        int(pixels.get('SizeY')),
+        'pixel_size_x':  float(pixels.get('PhysicalSizeX')),
+        'pixel_size_y':  float(pixels.get('PhysicalSizeY')),
+        'channel':       int(plane.get('TheC')),
+        'position_x':    float(plane.get('PositionX')),
+        'position_y':    float(plane.get('PositionY')),
+        'position_z':    float(plane.get('PositionZ')),
+        'actual_z':      float(plane.get('ActualPositionZ')),
+        'exposure_time': float(plane.get('ExposureTime')),
+    }
+
+def classify_tile_rect(pos_x, pos_y, rois):
+    """Classify a tile into a rectangular ROI."""
+    for name, roi in rois.items():
+        if (abs(pos_x - roi['ref_x']) <= roi['ext_w'] and
+            abs(pos_y - roi['ref_y']) <= roi['ext_h']):
+            return name
+    return 'UNKNOWN'
+#+end_src
+
+* Summary
+
+1. *TIFF ImageDescription* tag embeds OME-XML with precise stage
+   coordinates (=PositionX=, =PositionY=, =PositionZ=), pixel sizes, and
+   channel info. This is the primary metadata source.
+2. *File naming* encodes slide name, tile type (=R= or =TM=), field
+   number (=fNN=), and channel index (=dN=). The =fNN= field number is a
+   sequential acquisition order, not an ROI identifier.
+3. *ROI membership* is determined by comparing tile stage positions
+   against the region definitions in the =.scanprotocol= XML (rectangular
+   half-extents or polygon vertices).
+4. *Tile overlap* is controlled by =MinOverlapPixels= in the scanprotocol.
+5. *Scan pattern* (typically =SerpentineHorizontal=) determines the
+   order in which tiles are acquired within each ROI.

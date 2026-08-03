@@ -38,3 +38,4 @@ Use these scopes in Conventional Commits:
 - `html` — OpenSeadragon viewer, HTML template, scalebar
 - `nix` — `flake.nix`, `flake.lock`, Nix-related changes
 - `docs` — README, AGENTS.md, or other documentation
+- `evos` — EVOS M7000 microscope data formats, metadata parsing, and reference documentation
