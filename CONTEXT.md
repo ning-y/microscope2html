@@ -1,12 +1,28 @@
 # CONTEXT.md — microscope2html glossary
 
+## Scan directory
+A directory containing the exported output of one microscopy acquisition run: raw tiles, tile
+maps, per-tile stitch metadata, and the scan protocol. Multiple slides may be present.
+
 ## Slide
-A physical glass slide with tissue on it, placed under the microscope. All input TIFF files
-for a single invocation belong to the same slide.
+A physical glass slide with tissue on it, placed under the microscope. Tiles belonging to the
+same slide carry the same slide name. A single invocation may cover one or more slides.
 
 ## Tile
 A single TIFF file captured by the microscope. Contains one image frame with OME-TIFF
 metadata including stage coordinates (`PositionX`, `PositionY`) and pixel size (`PhysicalSizeX`).
+
+## Raw tile (R)
+A Tile containing a single field of view. Distinguished from a Tile Map by the `R` type field
+in its filename.
+
+## Tile Map (TM)
+A Tile containing one whole ROI, already stitched by the microscope's own software.
+Distinguished from a Raw tile by the `TM` type field in its filename.
+
+## Channel
+An acquisition mode within a scan, such as DAPI, GFP, RFP, CY5, or Transmitted. In EVOS
+filenames a tile's channel is encoded as `d<N>`.
 
 ## ROI (Region of Interest)
 A cluster of spatially adjacent tiles from the same slide. ROIs are detected automatically

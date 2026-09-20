@@ -109,6 +109,38 @@ Differences from raw tiles:
 - =ActualPosition*= fields may or may not be present; when present they
   duplicate =Position*=.
 
+** Position semantics
+
+=PositionX= / =PositionY= in the OME-XML denote the **center** of the
+image data, not its top-left corner:
+
+- For raw tiles, it is the center of the individual field of view.
+- For TM mosaics, it is the center of the whole mosaic.  It matches the
+  corresponding =ReferencePoint= of the scan location in the
+  =.scanprotocol= (verified on the observed dataset: all six TM
+  positions agree with their =Freeform_*= reference points to within a
+  few µm).
+
+Consumers that place multiple files on a common canvas using their
+metadata positions must subtract half the image extent — computed with
+that file's own =PhysicalSizeX=/=PhysicalSizeY= — to obtain the
+top-left origin.  For an all-raw-tile scan whose tiles share identical
+dimensions, this is a constant half-tile offset that cancels in
+relative layout; it only matters when file extents differ, as they do
+across TMs.
+
+** Rescaled TM mosaics
+
+=PhysicalSizeX= / =PhysicalSizeY= are **not constant across TM
+mosaics**.  On the observed dataset raw tiles were uniformly
+0.3086 µm/px, while the six TM mosaics reported 0.3086, 0.3680,
+0.3198, 0.3368, 0.3086 and 0.3086 µm/px.  The EVOS software appears to
+rescale large mosaics on export and update the reported pixel size
+accordingly.  Consumers must resample mosaics to a common scale before
+compositing them: treating the metadata positions as top-left and
+using a single global pixel size (which is sufficient for raw tiles)
+produces incorrect placement and scale for TMs.
+
 **.stitch Files**
 
 Each raw tile has a companion =.stitch= binary file (~1–10 MB,
@@ -242,3 +274,8 @@ def classify_tile_rect(pos_x, pos_y, rois):
 4. *Tile overlap* is controlled by =MinOverlapPixels= in the scanprotocol.
 5. *Scan pattern* (typically =SerpentineHorizontal=) determines the
    order in which tiles are acquired within each ROI.
+6. *OME-XML =PositionX=/=PositionY= denote the center* of the image
+   (tile center for raw tiles, mosaic center for TMs), matching the
+   scanprotocol =ReferencePoint=.  TM pixel sizes may vary per mosaic
+   because of export rescaling, so convert to top-left with each file's
+   own extent and resample to a common scale before compositing.

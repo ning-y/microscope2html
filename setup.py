@@ -2,7 +2,7 @@ from setuptools import setup, find_packages
 
 setup(
     name="microscope2html",
-    version="1.0.0",
+    version="1.1.0",
     description="Stitch microscope tiles and generate a standalone HTML viewer",
     author="Your Name",
     author_email="your.email@example.com",
@@ -22,5 +22,5 @@ setup(
         "License :: OSI Approved :: MIT License",
         "Operating System :: OS Independent",
     ],
-    python_requires=">=3.6",
+    python_requires=">=3.9",
 )
