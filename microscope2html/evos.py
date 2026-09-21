@@ -33,8 +33,9 @@ class ViewUnit:
     pas: str
     channel: Optional[int]
     raw_paths: List[str] = field(default_factory=list)
+    raw_by_channel: Dict[int, List[str]] = field(default_factory=dict)
     tm_paths: List[str] = field(default_factory=list)
-    tiles: List[tuple] = field(default_factory=list)
+    tiles: Dict[int, List[tuple]] = field(default_factory=dict)
 
     @property
     def use_tm(self) -> bool:
@@ -131,7 +132,7 @@ def discover_scan(directory: str, slide: Optional[str] = None,
         label = f"slide '{slide_name}', pass {pas}"
 
         if not raw_by_channel:
-            units.append(ViewUnit(slide_name, pas, None, [], tm_paths))
+            units.append(ViewUnit(slide_name, pas, None, tm_paths=tm_paths))
             continue
 
         if channel is not None:
@@ -142,18 +143,22 @@ def discover_scan(directory: str, slide: Optional[str] = None,
                 )
                 continue
             selected = channel
-        elif len(raw_by_channel) == 1:
-            selected = next(iter(raw_by_channel))
-        elif 4 in raw_by_channel:
-            selected = 4
         else:
-            problems.append(
-                f"{label}: multiple channels ({_fmt_channels(raw_by_channel)}) "
-                f"and no d4; re-run with --channel"
-            )
-            continue
+            # A viewer contains every captured channel.  ``channel`` remains
+            # available as an explicit single-channel export for compatibility.
+            selected = None
 
-        units.append(ViewUnit(slide_name, pas, selected,
-                              sorted(raw_by_channel[selected]), tm_paths))
+        selected_by_channel = (
+            {selected: sorted(raw_by_channel[selected])}
+            if selected is not None else
+            {key: sorted(value) for key, value in sorted(raw_by_channel.items())}
+        )
+        first_channel = next(iter(selected_by_channel))
+        units.append(ViewUnit(
+            slide_name, pas, selected,
+            raw_paths=selected_by_channel[first_channel],
+            raw_by_channel=selected_by_channel,
+            tm_paths=tm_paths,
+        ))
 
     return units, problems

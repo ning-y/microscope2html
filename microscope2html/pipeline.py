@@ -141,11 +141,12 @@ def generate_tile_config(tiles, config_path, base_dir):
 
 
 def generate_macro(output_macro, tile_config, output_image, input_dir,
-                   fix_white_channel):
+                   fix_white_channel, compute_overlap=True):
     """Generate an ImageJ macro for stitching a single ROI."""
     input_dir = os.path.abspath(input_dir)
     output_image = os.path.abspath(output_image)
 
+    overlap_option = "compute_overlap \\\n" if compute_overlap else ""
     macro = f"""
 run("Grid/Collection stitching", "type=[Positions from file] \
 order=[Defined by TileConfiguration] \
@@ -155,8 +156,7 @@ fusion_method=[Linear Blending] \
 regression_threshold=0.30 \
 max/avg_displacement_threshold=2.50 \
 absolute_displacement_threshold=3.50 \
-compute_overlap \
-computation_parameters=[Save memory (but be slower)] \
+{overlap_option}computation_parameters=[Save memory (but be slower)] \
 image_output=[Fuse and display]");
 """
 
@@ -198,31 +198,46 @@ def _preserve_roi_configs(workdir, index):
 
 
 def stitch_roi(roi_tiles, output_tif, workdir, fix_white=False,
-               keep_intermediates=False, index=None):
+               keep_intermediates=False, index=None, config_text=None):
     """Stitch a multi-tile ROI using Fiji."""
     if not _fiji_available():
         raise RuntimeError(
             "Fiji is not available. Install Fiji (or run inside `nix develop`) "
             "to stitch tiles."
         )
-    _stitch_roi_fiji(roi_tiles, output_tif, workdir, fix_white,
-                     keep_intermediates, index)
+    return _stitch_roi_fiji(roi_tiles, output_tif, workdir, fix_white,
+                            keep_intermediates, index, config_text)
 
 
 def _stitch_roi_fiji(roi_tiles, output_tif, workdir, fix_white=False,
-                     keep_intermediates=False, index=None):
+                     keep_intermediates=False, index=None, config_text=None):
     """Stitch a multi-tile ROI using Fiji.  All inputs live in *workdir*."""
     input_dir = os.path.abspath(workdir)
     config_path = os.path.join(input_dir, "TileConfiguration.txt")
-    generate_tile_config(roi_tiles, config_path, input_dir)
+    if config_text is None:
+        generate_tile_config(roi_tiles, config_path, input_dir)
+    else:
+        with open(config_path, "w") as f:
+            f.write(config_text)
 
     macro_file = os.path.join(input_dir, "stitch_tiles.ijm")
     config_name = os.path.basename(config_path)
-    generate_macro(macro_file, config_name, output_tif, input_dir, fix_white)
+    generate_macro(macro_file, config_name, output_tif, input_dir, fix_white,
+                   compute_overlap=config_text is None)
 
     print(f"  Running Fiji for {len(roi_tiles)} tiles...")
     cmd = [FIJI_CMD, "--headless", "--console", "-macro", macro_file]
     subprocess.run(cmd, check=True)
+    if not os.path.exists(output_tif):
+        raise RuntimeError(
+            f"Fiji completed without producing the expected output: {output_tif}"
+        )
+
+    registered_path = os.path.join(input_dir, "TileConfiguration.registered.txt")
+    registered_text = None
+    if os.path.exists(registered_path):
+        with open(registered_path) as f:
+            registered_text = f.read()
 
     if keep_intermediates and index is not None:
         _preserve_roi_configs(input_dir, index)
@@ -233,6 +248,7 @@ def _stitch_roi_fiji(roi_tiles, output_tif, workdir, fix_white=False,
         f = os.path.join(input_dir, name)
         if os.path.exists(f):
             os.remove(f)
+    return registered_text
 
 
 def download_assets():
@@ -468,6 +484,96 @@ def create_tiled_html_single(image_path, output_html, pixel_size_um):
     print(f"Saved standalone HTML to {output_html}")
 
 
+def _channel_colour(channel):
+    """Return conventional display colours for EVOS channel indices."""
+    return {0: (48, 100, 255), 1: (0, 255, 80), 2: (255, 60, 60),
+            3: (255, 0, 220), 4: (255, 255, 255)}.get(channel, (255, 255, 255))
+
+
+def _channel_label(channel):
+    return {0: "DAPI", 1: "GFP", 2: "RFP", 3: "CY5", 4: "Trans"}.get(
+        channel, f"Channel d{channel}")
+
+
+def create_tiled_html_channels(images, output_html, pixel_size_um):
+    """Create a standalone viewer with aligned, selectable channel layers."""
+    print("Generating channel tile pyramids...")
+    download_assets()
+    pyramids = {}
+    width = height = max_level = None
+    for channel, path in images.items():
+        tiles, image_width, image_height, image_level = generate_dzi_tiles(path)
+        if width is None:
+            width, height, max_level = image_width, image_height, image_level
+        elif (image_width, image_height, image_level) != (width, height, max_level):
+            raise ValueError("channel composites do not share an identical canvas")
+        pyramids[str(channel)] = tiles
+        print(f"  {_channel_label(channel)}: {len(tiles)} DZI tiles")
+
+    with open("openseadragon-bin-5.0.0/openseadragon.min.js") as f:
+        osd_script = f.read()
+    with open("openseadragon-scalebar.js") as f:
+        scalebar_script = f.read()
+    icons = {}
+    icon_prefix = "openseadragon-bin-5.0.0/images/"
+    for icon_name in os.listdir(icon_prefix):
+        if icon_name.endswith(".png"):
+            with open(os.path.join(icon_prefix, icon_name), "rb") as f:
+                icons[icon_name] = "data:image/png;base64," + base64.b64encode(
+                    f.read()).decode("utf-8")
+
+    labels = {str(channel): _channel_label(channel) for channel in images}
+    ppm = 1000000 / pixel_size_um if pixel_size_um > 0 else 1
+    buttons = "\n".join(
+        f'<button type="button" data-channel="{channel}">{label}</button>'
+        for channel, label in labels.items()
+    )
+    html = f"""<!DOCTYPE html>
+<html><head><meta charset="utf-8"><title>Multi-channel stitched image viewer</title>
+<style>
+html, body, #openseadragon1 {{ width: 100%; height: 100%; margin: 0; background: #000; }}
+#channel-controls {{ position: fixed; z-index: 10; top: 10px; right: 10px; display: flex; gap: 6px; padding: 7px; background: rgba(0,0,0,.7); border-radius: 4px; opacity: 0; pointer-events: none; transition: opacity .35s ease; }}
+#channel-controls.visible {{ opacity: 1; pointer-events: auto; }}
+#channel-controls button {{ color: white; background: #333; border: 1px solid #888; padding: 6px 10px; border-radius: 3px; cursor: pointer; }}
+#channel-controls button.active {{ background: #1769aa; border-color: #8ecaff; }}
+</style></head><body>
+<div id="channel-controls"><button type="button" data-channel="merge" class="active">Merge</button>{buttons}</div>
+<div id="openseadragon1"></div>
+<script>{osd_script}</script><script>{scalebar_script}</script>
+<script>
+const icons = {json.dumps(icons)};
+const channelTiles = {json.dumps(pyramids)};
+const channels = {json.dumps(labels)};
+const source = tiles => ({{width: {width}, height: {height}, tileSize: 256, tileOverlap: 0, minLevel: 0, maxLevel: {max_level}, getTileUrl: (level, x, y) => tiles[level + '/' + x + '_' + y]}});
+const navImages = {{ zoomIn: {{REST: icons['zoomin_rest.png'], GROUP: icons['zoomin_grouphover.png'], HOVER: icons['zoomin_hover.png'], DOWN: icons['zoomin_pressed.png']}}, zoomOut: {{REST: icons['zoomout_rest.png'], GROUP: icons['zoomout_grouphover.png'], HOVER: icons['zoomout_hover.png'], DOWN: icons['zoomout_pressed.png']}}, home: {{REST: icons['home_rest.png'], GROUP: icons['home_grouphover.png'], HOVER: icons['home_hover.png'], DOWN: icons['home_pressed.png']}}, fullpage: {{REST: icons['fullpage_rest.png'], GROUP: icons['fullpage_grouphover.png'], HOVER: icons['fullpage_hover.png'], DOWN: icons['fullpage_pressed.png']}} }};
+const order = Object.keys(channels);
+const layerItems = {{}};
+const viewer = OpenSeadragon({{id: 'openseadragon1', prefixUrl: '', navImages: navImages, tileSources: order.map(key => ({{tileSource: source(channelTiles[key]), compositeOperation: 'lighter', preload: true, success: event => {{ layerItems[key] = event.item; }}}}))}});
+viewer.scalebar({{pixelsPerMeter: {ppm}, xOffset: 10, yOffset: 10, barThickness: 3, color: 'white', fontColor: 'white', backgroundColor: 'rgba(0, 0, 0, .5)'}});
+function selectChannel(selected) {{
+  order.forEach(key => layerItems[key].setOpacity(selected === 'merge' || selected === key ? 1 : 0));
+  document.querySelectorAll('#channel-controls button').forEach(button => button.classList.toggle('active', button.dataset.channel === selected));
+}}
+viewer.addHandler('open', () => selectChannel('merge'));
+const controls = document.querySelector('#channel-controls');
+let hideControlsTimer;
+function showControls() {{
+  controls.classList.add('visible');
+  clearTimeout(hideControlsTimer);
+  hideControlsTimer = setTimeout(() => controls.classList.remove('visible'), 2000);
+}}
+document.addEventListener('mousemove', showControls);
+document.addEventListener('touchstart', showControls, {{passive: true}});
+controls.addEventListener('mouseenter', () => clearTimeout(hideControlsTimer));
+controls.addEventListener('mouseleave', showControls);
+controls.addEventListener('click', event => {{ if (event.target.dataset.channel) selectChannel(event.target.dataset.channel); }});
+showControls();
+</script></body></html>"""
+    with open(output_html, "w") as f:
+        f.write(html)
+    print(f"Saved standalone multi-channel HTML to {output_html}")
+
+
 def build_viewer(stitched_results, tiles, output_html, margin, pixel_size_um,
                  workdir):
     """Lay out stitched ROIs, composite them, and emit the HTML viewer.
@@ -528,6 +634,125 @@ def process_raw_tiles(tiles, output_html, margin, fix_white_setting, workdir,
             print(f"  → Stitched to {output_tif}")
 
     build_viewer(stitched_results, tiles, output_html, margin, px_size, workdir)
+
+
+def _field_key(path):
+    """The part of an EVOS raw filename shared by its channel siblings."""
+    stem, extension = os.path.splitext(os.path.basename(path))
+    return stem.rsplit("d", 1)[0] + extension
+
+
+def _translated_registered_config(config_text, reference_tiles, channel_tiles,
+                                  workdir):
+    """Retarget Fiji's registered tile configuration to a sibling channel."""
+    targets = {_field_key(tile[0]): tile[0] for tile in channel_tiles}
+    replacements = {}
+    for tile in reference_tiles:
+        key = _field_key(tile[0])
+        target = targets[key]
+        source_rel = os.path.relpath(os.path.abspath(tile[0]), os.path.abspath(workdir))
+        target_rel = os.path.relpath(os.path.abspath(target), os.path.abspath(workdir))
+        replacements[source_rel] = target_rel
+        # Fiji writes its registered configuration with bare filenames.
+        replacements[os.path.basename(tile[0])] = target_rel
+    for source, target in replacements.items():
+        config_text = config_text.replace(source, target)
+    return config_text
+
+
+def _composite_channel(stitched_results, positions, workdir, channel,
+                       canvas_size=None):
+    """Composite one channel at the reference ROI positions and pseudocolour it."""
+    roi_bounds = []
+    for index, (image_path, _roi) in enumerate(stitched_results):
+        with Image.open(image_path) as image:
+            width, height = image.size
+        x, y = positions[index]
+        roi_bounds.append((int(x), int(y), width, height))
+    if canvas_size is None:
+        canvas_size = compute_canvas_bounds(roi_bounds, [(x, y) for x, y, _, _ in roi_bounds])
+    canvas = Image.new("RGB", canvas_size, (0, 0, 0))
+    colour = np.asarray(_channel_colour(channel), dtype=np.uint16)
+    for image_path, (x, y, _width, _height) in zip(
+            (item[0] for item in stitched_results), roi_bounds):
+        with Image.open(image_path) as image:
+            values = np.asarray(image.convert("RGB"), dtype=np.uint16).max(axis=2)
+        data = (values[..., None] * colour // 255).astype(np.uint8)
+        canvas.paste(Image.fromarray(data, "RGB"), (x, y))
+    path = os.path.join(workdir, f"channel_{channel}_composite.tif")
+    canvas.save(path, bigtiff=True)
+    return path, canvas_size
+
+
+def process_raw_channels(tiles_by_channel, output_html, margin,
+                         fix_white_setting, workdir, keep_intermediates=False):
+    """Stitch aligned EVOS channels and emit one selectable-layer viewer.
+
+    Registration is computed once from the first channel and its resulting
+    Fiji configuration is reused for all sibling channels.  This prevents a
+    sparse fluorescence channel from independently drifting during alignment.
+    """
+    channels = sorted(tiles_by_channel)
+    reference_channel = channels[0]
+    reference_tiles = tiles_by_channel[reference_channel]
+    px_size = reference_tiles[0][1]
+    fix_white = (fix_white_setting and
+                 check_white_channel(reference_tiles[0][0]))
+    rois = cluster_tiles(reference_tiles)
+    print(f"Pixel size: {px_size:.4f} µm/px; reference: {_channel_label(reference_channel)}")
+    print(f"Detected {len(rois)} ROI(s).")
+    by_key = {
+        channel: {_field_key(tile[0]): tile for tile in channel_tiles}
+        for channel, channel_tiles in tiles_by_channel.items()
+    }
+    reference_results = []
+    registered_configs = []
+    for index, roi in enumerate(rois):
+        print(f"Registering ROI {index} ({len(roi)} tiles) on {_channel_label(reference_channel)}...")
+        if len(roi) == 1:
+            reference_results.append((roi[0][0], roi))
+            registered_configs.append(None)
+            continue
+        path = os.path.join(workdir, f"channel_{reference_channel}_roi_{index}.tif")
+        config = stitch_roi(roi, path, workdir, fix_white=fix_white,
+                            keep_intermediates=keep_intermediates, index=index)
+        if not config:
+            raise RuntimeError("Fiji did not write a registered tile configuration")
+        reference_results.append((path, roi))
+        registered_configs.append(config)
+
+    global_min_x = min(tile[2] / tile[1] for tile in reference_tiles)
+    global_min_y = min(tile[3] / tile[1] for tile in reference_tiles)
+    roi_bounds = []
+    for path, roi in reference_results:
+        with Image.open(path) as image:
+            width, height = image.size
+        roi_bounds.append((min(tile[2] / tile[1] for tile in roi) - global_min_x,
+                           min(tile[3] / tile[1] for tile in roi) - global_min_y,
+                           width, height))
+    positions = compress_layout(roi_bounds, margin)
+
+    channel_images = {}
+    reference_composite, canvas_size = _composite_channel(
+        reference_results, positions, workdir, reference_channel)
+    channel_images[reference_channel] = reference_composite
+    for channel in channels[1:]:
+        results = []
+        for index, reference_roi in enumerate(rois):
+            roi = [by_key[channel][_field_key(tile[0])] for tile in reference_roi]
+            if len(roi) == 1:
+                results.append((roi[0][0], roi))
+                continue
+            print(f"Fusing ROI {index} for {_channel_label(channel)} using shared registration...")
+            path = os.path.join(workdir, f"channel_{channel}_roi_{index}.tif")
+            config = _translated_registered_config(registered_configs[index], reference_roi,
+                                                    roi, workdir)
+            stitch_roi(roi, path, workdir, fix_white=False, config_text=config)
+            results.append((path, roi))
+        composite, _ = _composite_channel(results, positions, workdir, channel,
+                                          canvas_size=canvas_size)
+        channel_images[channel] = composite
+    create_tiled_html_channels(channel_images, output_html, px_size)
 
 
 def process_tm_rois(tm_paths, output_html, margin, workdir):

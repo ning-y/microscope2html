@@ -20,8 +20,8 @@ correctly.
 - **Automatic ROI detection** — groups tiles into regions of interest
   based on stage-coordinate bounding-box overlap.
 - **EVOS scan discovery** — point at an EVOS M7000 scan directory and
-  raw tiles are discovered, split per slide, and a channel is selected
-  automatically.
+  raw tiles are discovered, split per slide, and assembled into an
+  aligned multi-channel viewer.
 - **Fiji stitching** — Grid/Collection Stitching with pairwise phase
   correlation for sub-pixel alignment.
 - **Over-merge detection & correction** — detects when Fiji incorrectly
@@ -75,7 +75,7 @@ Two modes:
 microscope2html files *.TIF [OPTIONS]
 
 # Whole EVOS M7000 scan directory: discovers tiles, splits slides,
-# selects a channel, and writes one viewer per slide
+# stitches every captured channel, and writes one viewer per slide
 microscope2html evos scan.2026-07-11-10-09-33/ [OPTIONS]
 ```
 
@@ -85,11 +85,10 @@ Every tile **must** carry OME stage coordinates (`PositionX` / `PositionY`).
 
 Point `evos` at an EVOS M7000 output directory.  It selects the raw
 acquisition tiles (never the pre-stitched tile maps unless no raw tiles
-exist), groups them by slide and pass, and picks a channel:
-
-1. the only channel present, or
-2. `d4` (EVOS transmitted light) when several are present, or
-3. an explicit `--channel` if the slide has anything else.
+exist), groups them by slide and pass, and stitches every captured
+channel using shared registration. The viewer provides individual
+channel buttons and a pseudocoloured merge. Pass `--channel` to export
+only one raw channel.
 
 Output goes to `<scan-basename>_<slide>.html` in `--output-dir`
 (e.g. `scan.2026-07-11-10-09-33_bottom_slide.html`), with `_p<NN>`
@@ -101,7 +100,7 @@ warning.
 |---|---|---|
 | `--output-dir DIR` | `.` | Directory for the output HTML files |
 | `--slide NAME` | all | Only process this slide |
-| `--channel CN` | auto | Raw channel to use, e.g. `4` or `d4` |
+| `--channel CN` | all | Export only one raw channel, e.g. `4` or `d4` |
 | `--dry-run` | off | List the selected tiles, sources, and outputs without stitching |
 | `--margin PX` | `100` | Pixel margin between ROIs after empty‑space collapse |
 | `--fix-white-channel` / `--no-fix-white-channel` | on | Discard a spurious 4th (white) channel if detected |

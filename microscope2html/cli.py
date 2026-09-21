@@ -16,6 +16,7 @@ from microscope2html import __version__
 from microscope2html.evos import discover_scan, parse_channel
 from microscope2html.pipeline import (
     get_metadata,
+    process_raw_channels,
     process_raw_tiles,
     process_tm_rois,
     scratch_dir,
@@ -74,7 +75,7 @@ def build_parser():
         "evos",
         help="discover and stitch an EVOS M7000 scan directory",
         description="Discover raw tiles in an EVOS M7000 scan directory, "
-                    "split them per slide, select a channel, stitch, and "
+                    "split them per slide, stitch every channel, and "
                     "write one standalone HTML viewer per (slide, pass).",
     )
     p_evos.add_argument(
@@ -91,8 +92,8 @@ def build_parser():
     )
     p_evos.add_argument(
         "--channel", metavar="CN",
-        help="Raw channel to use, e.g. 4 or d4 "
-             "(default: the only channel, else d4)",
+        help="Export only this raw channel, e.g. 4 or d4 "
+             "(default: all captured channels)",
     )
     p_evos.add_argument(
         "--dry-run", action="store_true",
@@ -103,26 +104,26 @@ def build_parser():
     return parser
 
 
-def _validate_raw_tiles(unit):
-    """Read metadata for a unit's raw tiles and enforce one pixel grid.
+def _validate_raw_tiles(raw_paths, label):
+    """Read metadata for raw tiles and enforce one pixel grid.
 
     Returns ``(path, px, x, y, w, h)`` tuples ready for clustering.
     Raises ValueError naming the first offending file on mismatch.
     """
-    metas = [get_metadata(path) for path in unit.raw_paths]
+    metas = [get_metadata(path) for path in raw_paths]
     px0, _x0, _y0, w0, h0 = metas[0]
-    for path, (px, _x, _y, w, h) in zip(unit.raw_paths, metas):
+    for path, (px, _x, _y, w, h) in zip(raw_paths, metas):
         if not math.isclose(px, px0, rel_tol=1e-6, abs_tol=1e-9):
             raise ValueError(
                 f"{path}: pixel size {px:g} µm/px differs from {px0:g} µm/px "
-                f"in the rest of {unit.label}"
+                f"in the rest of {label}"
             )
         if (w, h) != (w0, h0):
             raise ValueError(
                 f"{path}: dimensions {w}×{h} differ from {w0}×{h0} "
-                f"in the rest of {unit.label}"
+                f"in the rest of {label}"
             )
-    return [(path,) + meta for path, meta in zip(unit.raw_paths, metas)]
+    return [(path,) + meta for path, meta in zip(raw_paths, metas)]
 
 
 def _passes_by_slide(units):
@@ -144,10 +145,13 @@ def _print_dry_run(units, directory, output_dir, problems):
     passes_by_slide = _passes_by_slide(units)
     print(f"Dry run: {directory}")
     for unit in units:
-        kind = ("tile maps (no stitching)" if unit.use_tm
-                else f"raw tiles, channel d{unit.channel}")
+        kind = ("tile maps (no stitching)" if unit.use_tm else
+                "raw tiles, channels " + ", ".join(
+                    f"d{channel}" for channel in unit.raw_by_channel))
         print(f"\n{unit.label}: {kind}")
-        paths = unit.tm_paths if unit.use_tm else unit.raw_paths
+        paths = unit.tm_paths if unit.use_tm else [
+            path for paths in unit.raw_by_channel.values() for path in paths
+        ]
         for path in paths:
             print(f"  {os.path.basename(path)}")
         if unit.raw_paths and unit.tm_paths:
@@ -201,7 +205,22 @@ def cmd_evos(args):
     for unit in units:
         try:
             if unit.raw_paths:
-                unit.tiles = _validate_raw_tiles(unit)
+                unit.tiles = {
+                    channel: _validate_raw_tiles(
+                        paths, f"{unit.label}, channel d{channel}")
+                    for channel, paths in unit.raw_by_channel.items()
+                }
+                reference = next(iter(unit.tiles.values()))
+                reference_keys = {os.path.basename(tile[0]).rsplit("d", 1)[0]
+                                  for tile in reference}
+                for channel, channel_tiles in unit.tiles.items():
+                    keys = {os.path.basename(tile[0]).rsplit("d", 1)[0]
+                            for tile in channel_tiles}
+                    if keys != reference_keys:
+                        raise ValueError(
+                            f"{unit.label}: channel d{channel} does not have "
+                            "the same fields as the reference channel"
+                        )
             else:
                 for path in unit.tm_paths:
                     get_metadata(path)
@@ -249,9 +268,9 @@ def cmd_evos(args):
                     process_tm_rois(unit.tm_paths, output_html, args.margin,
                                     workdir)
                 else:
-                    process_raw_tiles(unit.tiles, output_html, args.margin,
-                                      args.fix_white_channel, workdir,
-                                      args.keep_intermediates)
+                    process_raw_channels(unit.tiles, output_html, args.margin,
+                                         args.fix_white_channel, workdir,
+                                         args.keep_intermediates)
         except Exception as e:  # keep other units going
             failures += 1
             print(f"Error: {type(e).__name__}: {e}", file=sys.stderr)
