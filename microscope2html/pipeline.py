@@ -356,6 +356,146 @@ def composite_rois(stitched_images, positions, workdir):
     return composite_path
 
 
+# OpenSeadragonScalebar renders "NaN m" whenever its unit formatter receives a
+# pixels-per-meter of 0/NaN.  The plugin derives that value from the tiled image's
+# animation spring, which is still 0 when the bar first refreshes (before the image
+# is placed) and from the minWidth it cached at construction (0 when the bar was
+# built before it was laid out); every comparison in getWithUnit() then fails and it
+# falls through to `NaN + " m"`.  Emitted viewers therefore measure the displayed
+# pixels-per-meter the same way the plugin does -- viewport zoom times container
+# width over image width, but without the spring, which is 1 whenever the image is
+# placed -- so the value is identical to the plugin's whenever that one is valid,
+# yet already correct on the first refresh, and so a non-finite value can never
+# reach the formatter.  The computation is re-run once the viewer has opened or the
+# page has become visible.
+_SCALEBAR_JS = """
+        var metricScalebar =
+            OpenSeadragon.ScalebarSizeAndTextRenderer.METRIC_LENGTH;
+        var lastScalebar = { size: 0, text: "" };
+
+        function displayedPixelsPerMeter(pixelsPerMeter, referenceItemIdx) {
+            var item = viewer.world.getItemAt(referenceItemIdx || 0);
+            var container = viewer.viewport._containerInnerSize;
+            if (!container || !(container.x > 0) || !(container.y > 0)) {
+                container = { x: viewer.container.clientWidth,
+                              y: viewer.container.clientHeight };
+            }
+            if (!item || !(container.x > 0)) {
+                return 0;
+            }
+            var image = item.source ? item.source.dimensions
+                                    : item.getContentSize();
+            if (!image || !(image.x > 0)) {
+                return 0;
+            }
+            return viewer.viewport.getZoom(true) * (container.x / image.x)
+                * pixelsPerMeter;
+        }
+
+        function scalebarText(brokenPixelsPerMeter, minWidth) {
+            var bar = viewer.scalebarInstance;
+            var measured = bar ?
+                displayedPixelsPerMeter(bar.pixelsPerMeter,
+                                        bar.referenceItemIdx) : 0;
+            if (isFinite(measured) && measured > 0) {
+                lastScalebar = metricScalebar(measured,
+                    isFinite(minWidth) && minWidth > 0 ? minWidth : 150);
+            }
+            return lastScalebar;
+        }
+
+        function refreshScalebar() {
+            if (viewer.scalebarInstance) {
+                viewer.scalebarInstance.refresh();
+            }
+        }
+
+        function enableScalebar(ppm) {
+            viewer.scalebar({
+                pixelsPerMeter: ppm,
+                sizeAndTextRenderer: scalebarText,
+                xOffset: 10,
+                yOffset: 10,
+                barThickness: 3,
+                color: "white",
+                fontColor: "white",
+                backgroundColor: "rgba(0, 0, 0, 0.5)"
+            });
+            viewer.addHandler("open", refreshScalebar);
+            window.addEventListener("load", refreshScalebar);
+            document.addEventListener("visibilitychange", refreshScalebar);
+        }
+"""
+
+
+# Optional deep link: `#roi=x0,y0,x1,y1` (or `?roi=...`), in full-resolution
+# composite pixels, fits that rectangle in the viewport as soon as the viewer
+# opens -- and again on every later hash change -- so an embedding page (e.g.
+# a slide iframe) can pre-zoom to a region of interest without scripting the
+# viewer from the outside.  If the viewer is opened inside a hidden container
+# (an inactive Slidev slide, a background tab), the fit is deferred until the
+# container is laid out.
+_DEEPLINK_JS = """
+        var roiPending = false;
+
+        function applyRoiFromUrl() {
+            var params = new URLSearchParams(location.search);
+            if (!params.has("roi")) {
+                params = new URLSearchParams(location.hash.slice(1));
+            }
+            var roi = params.get("roi");
+            if (!roi) {
+                roiPending = false;
+                return;
+            }
+            var p = roi.split(",").map(Number);
+            if (p.length !== 4 || p.some(function (v) { return !isFinite(v); })) {
+                roiPending = false;
+                return;
+            }
+            var x0 = Math.min(p[0], p[2]);
+            var y0 = Math.min(p[1], p[3]);
+            var x1 = Math.max(p[0], p[2]);
+            var y1 = Math.max(p[1], p[3]);
+            var item = viewer.world.getItemAt(0);
+            if (!item || !(x1 > x0) || !(y1 > y0)) {
+                roiPending = false;
+                return;
+            }
+            if (!viewer.container.clientWidth || !viewer.container.clientHeight) {
+                roiPending = true;
+                return;
+            }
+            roiPending = false;
+            viewer.viewport.fitBounds(
+                item.imageToViewportRectangle(x0, y0, x1 - x0, y1 - y0),
+                true
+            );
+        }
+
+        function applyRoiAfterResize() {
+            if (roiPending) {
+                // Deferred by a frame so OpenSeadragon's own resize
+                // handling, which would otherwise overwrite the fitted
+                // view, runs first.
+                requestAnimationFrame(function () {
+                    if (roiPending) {
+                        applyRoiFromUrl();
+                    }
+                });
+            }
+        }
+
+        viewer.addHandler("open", applyRoiFromUrl);
+        window.addEventListener("hashchange", applyRoiFromUrl);
+        if (typeof ResizeObserver === "function") {
+            new ResizeObserver(applyRoiAfterResize).observe(viewer.container);
+        } else {
+            window.addEventListener("resize", applyRoiAfterResize);
+        }
+"""
+
+
 def create_tiled_html_single(image_path, output_html, pixel_size_um):
     """Create a standalone HTML viewer with a single embedded DZI tile pyramid."""
     print(f"Generating tile pyramid for {os.path.basename(image_path)}...")
@@ -466,15 +606,10 @@ def create_tiled_html_single(image_path, output_html, pixel_size_um):
             }}
         }});
 
-        viewer.scalebar({{
-            pixelsPerMeter: {ppm},
-            xOffset: 10,
-            yOffset: 10,
-            barThickness: 3,
-            color: "white",
-            fontColor: "white",
-            backgroundColor: "rgba(0, 0, 0, 0.5)"
-        }});
+        {_SCALEBAR_JS}
+
+        enableScalebar({ppm});
+        {_DEEPLINK_JS}
     </script>
 </body>
 </html>
@@ -549,7 +684,9 @@ const navImages = {{ zoomIn: {{REST: icons['zoomin_rest.png'], GROUP: icons['zoo
 const order = Object.keys(channels);
 const layerItems = {{}};
 const viewer = OpenSeadragon({{id: 'openseadragon1', prefixUrl: '', navImages: navImages, tileSources: order.map(key => ({{tileSource: source(channelTiles[key]), compositeOperation: 'lighter', preload: true, success: event => {{ layerItems[key] = event.item; }}}}))}});
-viewer.scalebar({{pixelsPerMeter: {ppm}, xOffset: 10, yOffset: 10, barThickness: 3, color: 'white', fontColor: 'white', backgroundColor: 'rgba(0, 0, 0, .5)'}});
+{_SCALEBAR_JS}
+enableScalebar({ppm});
+{_DEEPLINK_JS}
 function selectChannel(selected) {{
   order.forEach(key => layerItems[key].setOpacity(selected === 'merge' || selected === key ? 1 : 0));
   document.querySelectorAll('#channel-controls button').forEach(button => button.classList.toggle('active', button.dataset.channel === selected));
@@ -671,16 +808,17 @@ def _composite_channel(stitched_results, positions, workdir, channel,
         roi_bounds.append((int(x), int(y), width, height))
     if canvas_size is None:
         canvas_size = compute_canvas_bounds(roi_bounds, [(x, y) for x, y, _, _ in roi_bounds])
-    canvas = Image.new("RGB", canvas_size, (0, 0, 0))
+    canvas = np.zeros((canvas_size[1], canvas_size[0], 3), dtype=np.uint8)
     colour = np.asarray(_channel_colour(channel), dtype=np.uint16)
-    for image_path, (x, y, _width, _height) in zip(
+    for image_path, (x, y, width, height) in zip(
             (item[0] for item in stitched_results), roi_bounds):
         with Image.open(image_path) as image:
             values = np.asarray(image.convert("RGB"), dtype=np.uint16).max(axis=2)
         data = (values[..., None] * colour // 255).astype(np.uint8)
-        canvas.paste(Image.fromarray(data, "RGB"), (x, y))
+        canvas[y:y + height, x:x + width] = data
     path = os.path.join(workdir, f"channel_{channel}_composite.tif")
-    canvas.save(path, bigtiff=True)
+    # tifffile: PIL's writer cannot emit BigTIFF offsets beyond 4 GiB.
+    tifffile.imwrite(path, canvas, bigtiff=True)
     return path, canvas_size
 
 

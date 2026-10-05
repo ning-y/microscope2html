@@ -9,6 +9,7 @@ from microscope2html.evos import discover_scan
 from microscope2html.pipeline import (
     _translated_registered_config,
     create_tiled_html_channels,
+    create_tiled_html_single,
     generate_macro,
 )
 
@@ -81,6 +82,23 @@ class MultiChannelTests(unittest.TestCase):
             self.assertIn("top: 10px; right: 10px", html)
             self.assertIn("hideControlsTimer", html)
             self.assertIn('data-channel="merge"', html)
+
+    def test_viewers_guard_scalebar_against_nan(self):
+        with tempfile.TemporaryDirectory() as directory:
+            image = os.path.join(directory, "image.png")
+            Image.new("RGB", (2, 2), (128, 128, 128)).save(image)
+
+            single = os.path.join(directory, "single.html")
+            create_tiled_html_single(image, single, 1.0)
+            channels = os.path.join(directory, "channels.html")
+            create_tiled_html_channels({0: image}, channels, 1.0)
+
+            for output in (single, channels):
+                html = Path(output).read_text()
+                self.assertIn("sizeAndTextRenderer: scalebarText", html)
+                self.assertIn("displayedPixelsPerMeter(bar.pixelsPerMeter", html)
+                self.assertIn("return lastScalebar;", html)
+                self.assertIn('viewer.addHandler("open", refreshScalebar)', html)
 
 
 if __name__ == "__main__":

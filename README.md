@@ -32,6 +32,9 @@ correctly.
 - **Standalone HTML** — embeds DZI tiles, OpenSeadragon, and icons in a
   single file.  No server needed.
 - **Scalebar** — pixel size extracted from OME-TIFF metadata.
+- **Deep-linked view** — the viewer URL may carry `#roi=x0,y0,x1,y1`
+  (full-resolution composite pixels) to open pre-zoomed to a region of
+  interest, e.g. when embedded in a slide `<iframe>`.
 
 ## Requirements
 
@@ -144,6 +147,27 @@ microscope2html files *.TIF --output slide.html
 Note: the scratch directory (and the composite canvas, which can be
 several GB) lives under the system temp directory; set `TMPDIR` if it
 needs more space.
+
+### Deep links / embedding
+
+A generated viewer is one self-contained HTML file, so it can be embedded in a
+slide via `<iframe>`.  Append `#roi=x0,y0,x1,y1` (full-resolution composite
+pixel coordinates) to open it pre-zoomed to that region:
+
+```html
+<iframe src="/my-slide.html#roi=20000,4000,26000,8000" class="h-full w-full border-0" />
+```
+
+To pick the numbers, open the viewer directly, zoom to the region, and run
+this in the devtools console:
+
+```js
+const r = viewer.viewport.viewportToImageRectangle(viewer.viewport.getBounds());
+[r.x, r.y, r.x + r.width, r.y + r.height].map(Math.round);  // → x0, y0, x1, y1
+```
+
+The fragment is re-applied on every `hashchange`, so an embedding page can
+re-target the view without reloading the viewer.
 
 ## How it works
 
